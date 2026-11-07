@@ -17,7 +17,7 @@
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.1.1" # @version
+DEFAULT_VERSION="0.1.2" # @version
 
 # --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
 # TAG, live here on purpose (a checksum fetched from the host that serves the script proves nothing). The script is
@@ -519,6 +519,17 @@ start_portforward() {
 }
 
 wait_app() {
+  # apsd.replicaCount=0 (e.g. while restoring a database before the first start): nothing can answer /readyz, so do
+  # not wait for the app; only the web Deployment is checked.
+  _rep="$(kc -n "$NS" get deploy "$REL-apsd" -o 'jsonpath={.spec.replicas}' 2>/dev/null)" || _rep=""
+  if [ "$_rep" = 0 ]; then
+    say "apsd is scaled to 0 replicas (apsd.replicaCount=0): not waiting for the app to answer; scale it up to start serving."
+    kc -n "$NS" rollout status "deploy/$REL-web" --timeout "$TIMEOUT" >&2 \
+      || die 4 "deployment $REL-web did not become ready within $TIMEOUT. Look at: kubectl -n $NS get pods"
+    discover_url
+    APSD_ZERO=1
+    return 0
+  fi
   for _d in apsd web; do
     kc -n "$NS" rollout status "deploy/$REL-$_d" --timeout "$TIMEOUT" >&2 \
       || die 4 "deployment $REL-$_d did not become ready within $TIMEOUT. Look at: kubectl -n $NS get pods; kubectl -n $NS describe pod -l app.kubernetes.io/instance=$REL"
@@ -580,9 +591,11 @@ report_indexes() {
 
 final_message() {
   if [ "$DISCOVERED" = 1 ]; then _url="$BASE_URL"; else _url="http://localhost:8080"; fi
+  _ready="Astro Pixel Platform is ready."
+  [ "${APSD_ZERO:-0}" != 1 ] || _ready="Astro Pixel Platform is installed, with apsd scaled to 0 (it does not serve yet: re-run without apsd.replicaCount=0)."
   cat <<MSG
 
-Astro Pixel Platform is ready.
+$_ready
 
   Open:      $_url/
 MSG
