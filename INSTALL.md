@@ -157,7 +157,7 @@ Pass overrides with `--set key=value` and/or `--values file.yaml` (repeatable; t
 | `plateSolve.indexes.hostPath` | `/var/lib/aps/astrometry-index` | node-local path |
 | `plateSolve.indexes.nodeSelector/tolerations` | none | which nodes hold indexes and serve solves (tainted nodes are skipped unless tolerated) |
 | `apsd.registration` | `first-user` | `first-user`, `open`, `closed` |
-| `apsd.autoSolve`, `apsd.autoExtractMeta` | `true` | process every upload automatically |
+| `apsd.autoSolve`, `apsd.autoExtractMeta`, `apsd.autoRender` | `true` | process every upload automatically; `autoRender` renders its Library thumbnail (and the thumbnail of every stack/calibrate product). Tile pyramids are rendered on a frame's first view whatever this says |
 | `db.mode`, `objectStore.mode` | `incluster` | `external` for your own Postgres (needs pg_sphere) / S3 |
 | `secrets.existingSecret` | generated | bring your own credentials Secret |
 
@@ -247,30 +247,16 @@ indexes and the label yourself with `plateSolve.indexSource.mode=preSeeded`.
   and `/argo/` falls through to the web app. There, leave `argoUI.enabled=false` and expose argo-server another way, for
   example `--set argo-workflows.server.serviceType=NodePort --set argo-workflows.server.serviceNodePort=30746` (plain HTTP,
   client auth: paste `Bearer $(kubectl -n aps create token aps-apsd --duration=24h)` into the UI) or a port-forward.
-* `plateSolve.indexes.hostPath` may point at a directory that already holds the index files (for example from an earlier
-  hand install): the fetcher then verifies each file against the mirror and downloads nothing for complete ones. The directory
+* `plateSolve.indexes.hostPath` may point at a directory that already holds the index files (for example one you filled by
+  hand): the fetcher then verifies each file against the mirror and downloads nothing for complete ones. The directory
   must be owned by root (`chown root:root`, mode 755): the fetcher runs as root without `CAP_DAC_OVERRIDE` and otherwise cannot
   write its `.set-<id>` marker (it logs `cannot write` and retries). Marking a very large set complete takes a while on a
   slow disk because every file is checked.
-* Moving an existing deployment in (database dump + object copy + wiping a hand-installed Argo) is covered by
-  `deploy/migrate/README.md`. Install with `--set apsd.replicaCount=0` first: the installer does not wait for the app then.
-
-## Transitional removal checklist
-
-The chart still carries the pre-Argo NATS path for the two verbs not yet ported. As each is ported, delete in this order:
-
-1. `transitional.*` values (`queue`, `apsworker`) and `templates/transitional-queue.yaml` (+ `tests/queue_test.yaml`), the
-   `NATS_URL` env entry in `templates/apsd.yaml`, and `nats:<NATS_TAG>` from `deploy/helm/tools.env`.
-2. In apsd: the NATS block of `cmd/apsd/main.go`, `internal/queue` (keep `Publisher` only if something still needs it),
-   `WithoutQueue` and the `queue.Unavailable` path in `internal/api`, and `cmd/apsworker`.
-3. In the `aps-apsd` image: the `apsworker` binary and the `worker/` scripts of every verb that has moved to `verbs/<verb>/`
-   (`stack`, `calibrate`, `footprint`, `tile`, `fitsmeta` as they are ported).
-4. In the docs: this checklist, the `nats` image in the air-gapped list above, and the HANDOFF "transitional" notes.
 
 ## Air-gapped and mirrored installs
 
-Everything is a parameter. Mirror the seven images (`apsd web pg-sphere solve extract-meta reftool index-fetcher`, named
-`aps-<name>:<version>`), `rustfs/rustfs:1.0.4`, `nats:2.10.29` (only with the transitional queue) and the Argo images
+Everything is a parameter. Mirror the ten images (`apsd web pg-sphere solve extract-meta stack calibrate render reftool index-fetcher`, named
+`aps-<name>:<version>`), `rustfs/rustfs:1.0.4` and the Argo images
 (`quay.io/argoproj/workflow-controller`, `argocli`, `argoexec`, `argo-workflows-crdinstaller` at the Argo version of the chart) into
 your registry, then:
 

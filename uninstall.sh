@@ -210,7 +210,7 @@ EOF
   if [ -n "$PURGE_DATA" ]; then
     # Volumes and Secret go together: a Secret without its volume (or the reverse) is a database nobody can open.
     say "Deleting the data volumes and the Secret ${REL}-secrets"
-    kc -n "$NS" delete pvc -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/component in (pg,rustfs,nats)" --wait --timeout=180s \
+    kc -n "$NS" delete pvc -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/component in (pg,rustfs)" --wait --timeout=180s \
       || die 3 "could not delete the volumes; the Secret ${REL}-secrets was NOT deleted (they must be deleted together). Re-run with --purge-data."
     kc -n "$NS" delete secret "${REL}-secrets" --ignore-not-found || die 3 "could not delete the Secret ${REL}-secrets"
   fi
