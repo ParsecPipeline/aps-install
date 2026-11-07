@@ -19,6 +19,56 @@ Everything the script does is visible in the script (`sh install.sh --help` list
 kubeconfig, writes only to a temporary directory it removes on exit, and runs `helm upgrade --install` on the chart
 `oci://ghcr.io/parsecpipeline/charts/aps` (pinned to the version the script was published with).
 
+## Flags
+
+`install.sh --help` is the authoritative list (every flag has an `APS_*` environment twin). The ones you will use:
+
+| Flag | Meaning |
+|---|---|
+| `--namespace NS`, `--release NAME` | where and under which name the release lives (default `aps` / `aps`) |
+| `--values FILE`, `--set K=V` | Helm values, repeatable, applied in the order given |
+| `--chart DIR\|TGZ`, `--chart-url URL`, `--version V` | install a local or downloaded chart instead of the published OCI chart |
+| `--context NAME` | kubectl/helm context (`KUBECONFIG` is honoured) |
+| `--url URL` | the address printed (and checked) as the one users open, overriding Ingress discovery |
+| `--timeout DUR`, `--wait-indexes[=DUR]` | readiness budget; optionally wait for the astrometry indexes on every node |
+| `--helm-version V` | pinned helm to download when none >= 3.14 is on `PATH` |
+| `--dry-run` | pass `--dry-run` to Helm: nothing is installed |
+| `--bootstrap`, `--k3s-version V` | install single-node k3s first on a bare host (next section) |
+
+`uninstall.sh --help` lists `--release`, `--namespace`, `--context`, `--purge-data`, `--purge-crds`, `--purge-indexes`,
+`--index-image IMG` (the image of the purge pods when the release is already gone) and `--remove-k3s` (see Uninstalling).
+
+## A bare Linux host with no Kubernetes: `--bootstrap`
+
+On a single Linux machine (a VM, a home server) with no cluster, one opt-in flag installs a single-node
+[k3s](https://k3s.io) first and then the platform, as root:
+
+```sh
+curl -sfL https://raw.githubusercontent.com/parsecpipeline/aps-install/main/install.sh | sudo sh -s -- --bootstrap --yes
+```
+
+It prints `http://<host-ip>/` when it is done (open it, the first account you register becomes the owner).
+
+- **Opt-in only.** Without `--bootstrap` the script never installs Kubernetes. With it, a cluster that is already reachable
+  (your kubeconfig answers) is left alone: the k3s step is skipped and the script says so. A host that already runs k3s from an
+  earlier `--bootstrap` is reused (its kubeconfig is picked up), never reinstalled over.
+- **Needs root** for the k3s step (`sudo sh`), with a clear error otherwise, and a Linux host with ports 80 and 443 free (k3s's
+  ingress listens there; the script refuses when something else already does).
+- **What is installed:** k3s at a pinned version (`--k3s-version`, default `v1.34.13+k3s1`) through its official installer script.
+  The script is taken from that release tag of the k3s repository (not from `get.k3s.io`, which always serves the moving
+  newest copy and so cannot be checksum-pinned) and verified against a SHA-256 embedded in `install.sh` before it runs; the
+  installer then verifies the k3s binary against the release's own checksum file. A different `--k3s-version` needs
+  `APS_K3S_INSTALL_SHA256` (the sha256 of that tag's `install.sh`). The script waits for the node to be Ready, for k3s's
+  default StorageClass and for Traefik, uses `/etc/rancher/k3s/k3s.yaml` for the rest of the run and installs the chart normally.
+- **Ingress: k3s's bundled Traefik, unchanged.** Traefik is the default IngressClass on k3s and handles the chart's Ingress as it
+  is: it does not cap request bodies, does not buffer requests and flushes event streams immediately, so large uploads and the
+  live run stream work with no extra annotations (the `ingress-nginx` annotations of the default preset are ignored by Traefik).
+  The alternative (disabling Traefik and installing ingress-nginx) means a second download, a second thing to keep patched and an
+  ingress-nginx that is being retired upstream, for no benefit here, so it is deliberately not done. `install-smoke` proves the
+  large-body and event-stream behaviour through Traefik on every VM run.
+- **kubectl afterwards:** `export KUBECONFIG=/etc/rancher/k3s/k3s.yaml` as root, or `sudo k3s kubectl ...`.
+- **Removing it again:** `uninstall.sh --remove-k3s` (below).
+
 ## Prerequisites
 
 | Need | Why | If missing |
@@ -87,6 +137,9 @@ refuses unless you pass `--yes` (or `APS_ASSUME_YES=1`).
 | `--purge-data` (`--purge`) | the volumes (every frame, user, run) **and** the Secret, always together |
 | `--purge-crds` | the `*.argoproj.io` CRDs (this deletes every Argo Workflow on the cluster) |
 | `--purge-indexes` | the index files on every node and the node label/annotation (a short pod per node) |
+| `--remove-k3s` | the single-node k3s that `install.sh --bootstrap` installed, **last**, by running its `k3s-uninstall.sh` (root; opt-in). This deletes the whole cluster and everything stored in it whatever the other flags say; the node-local index directory `/var/lib/aps` lives outside k3s, so add `--purge-indexes` to remove it too |
+
+On a bootstrapped host: `curl -sfL .../uninstall.sh | sudo sh -s -- --remove-k3s --purge-indexes --yes`.
 
 ## Configuration
 

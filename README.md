@@ -7,9 +7,18 @@ object store, the API and web UI, the plate-solving verbs and the per-node astro
 curl -sfL https://raw.githubusercontent.com/parsecpipeline/aps-install/main/install.sh | sh -
 ```
 
-This copy installs release **0.1.0**. You need `kubectl` pointed at the cluster (a cluster-admin context: the install
+This copy installs release **0.1.1**. You need `kubectl` pointed at the cluster (a cluster-admin context: the install
 creates CRDs and ClusterRoles) and a default StorageClass. Helm is downloaded (checksum-pinned) into a temporary directory
 when you do not have it.
+
+No Kubernetes on the machine yet? On a bare Linux host the opt-in `--bootstrap` flag installs single-node k3s first
+(pinned version, checksum-verified installer, its bundled Traefik as the ingress) and then the platform, and prints
+`http://<host-ip>/`:
+
+```sh
+curl -sfL https://raw.githubusercontent.com/parsecpipeline/aps-install/main/install.sh | sudo sh -s -- --bootstrap --yes
+curl -sfL https://raw.githubusercontent.com/parsecpipeline/aps-install/main/uninstall.sh | sudo sh -s -- --remove-k3s --purge-indexes --yes   # and back
+```
 
 Pass options after `-s --`:
 

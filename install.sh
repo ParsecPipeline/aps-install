@@ -8,12 +8,24 @@
 # volumes and the node-local astrometry indexes. POSIX sh. Never uses sudo, never edits your kubeconfig, never
 # writes outside a mktemp directory (removed on exit).
 #
+# Bare Linux host with no Kubernetes? The opt-in `--bootstrap` flag installs single-node k3s first (run as root):
+#   curl -sfL <url>/install.sh | sudo sh -s -- --bootstrap --yes
+# Without the flag this script never installs Kubernetes.
+#
 # Exit codes: 0 ok | 2 preflight / usage | 3 helm failed | 4 timed out waiting for the app.
 
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.1.0" # @version
+DEFAULT_VERSION="0.1.1" # @version
+
+# --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
+# TAG, live here on purpose (a checksum fetched from the host that serves the script proves nothing). The script is
+# taken from the k3s repository tag, not from get.k3s.io, because get.k3s.io serves the moving master copy and can
+# never match a pinned checksum; it is the same script, and it verifies the k3s binary against the release's own
+# checksum file. Another version needs APS_K3S_INSTALL_SHA256 (the sha256 of that tag's install.sh).
+PINNED_K3S_VERSION="v1.34.13+k3s1"
+K3S_INSTALL_SHA256_PINNED="40b487f0d8ef4f5d1bf422e7bb6228cc7789c40ecc66c5ab067d396bbee9816e"
 
 usage() {
   cat <<'USAGE'
@@ -33,6 +45,12 @@ Usage: install.sh [flags]
                          without it the install only reports index progress and never blocks on it
   --url URL              the address users will open, overriding Ingress discovery (env APS_URL)
   --plain-http           the OCI chart registry speaks plain HTTP (a local/lab registry; env APS_PLAIN_HTTP=1)
+  --bootstrap            bare Linux host with no reachable Kubernetes: first install single-node k3s (pinned version,
+                         checksum-verified installer, its bundled Traefik is the ingress), wait for the node, use
+                         /etc/rancher/k3s/k3s.yaml, then install normally. Needs root (curl ... | sudo sh -s -- --bootstrap).
+                         A reachable cluster is left alone. Opt-in: without it Kubernetes is never installed (env APS_BOOTSTRAP=1)
+  --k3s-version V        k3s release for --bootstrap (default pinned v1.34.13+k3s1; another version needs
+                         APS_K3S_INSTALL_SHA256 = sha256 of that tag's install.sh; env APS_K3S_VERSION)
   --yes, -y              do not ask for confirmation (env APS_ASSUME_YES=1)
   --dry-run              pass --dry-run to helm (nothing is installed)
   --adopt-argo-crds      proceed although Argo Workflows CRDs already exist on the cluster (they will be
@@ -90,6 +108,11 @@ WAIT_INDEXES=0
 DRY_RUN=""
 ADOPT_CRDS=""
 PLAIN_HTTP="${APS_PLAIN_HTTP:-}"
+BOOTSTRAP="${APS_BOOTSTRAP:-}"
+K3S_VERSION="${APS_K3S_VERSION:-}"
+K3S_KUBECONFIG="${APS_K3S_KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"   # APS_K3S_KUBECONFIG is a test seam
+BOOT_WAIT="${APS_BOOTSTRAP_WAIT:-300}"                                # seconds per bootstrap wait (test seam)
+BOOTSTRAPPED=""                                                       # k3s-installed | k3s-existing
 HELM_USER=""   # user -f/--set flags, shell-quoted, in the order given
 HELM_BASE_URL="${APS_HELM_BASE_URL:-https://get.helm.sh}"
 TTY_DEV="${APS_TTY:-/dev/tty}"   # APS_TTY is a test seam
@@ -119,11 +142,16 @@ parse_args() {
       --dry-run) DRY_RUN=1; shift ;;
       --adopt-argo-crds) ADOPT_CRDS=1; shift ;;
       --plain-http) PLAIN_HTTP=1; shift ;;
+      --bootstrap) BOOTSTRAP=1; shift ;;
+      --k3s-version) [ $# -ge 2 ] || die 2 "--k3s-version needs a value"; K3S_VERSION="$2"; shift 2 ;;
       --help|-h) usage; exit 0 ;;
       *) usage >&2; die 2 "unknown argument: $1" ;;
     esac
   done
   TIMEOUT_S="$(dur_secs "$TIMEOUT")" || die 2 "bad --timeout duration: $TIMEOUT (use 90s, 15m, 1h)"
+  if [ -n "$BOOTSTRAP" ] && [ -n "$CTX" ]; then
+    die 2 "--bootstrap installs a new local k3s cluster and cannot be combined with --context (that names an existing cluster)"
+  fi
 }
 
 # ---------------------------------------------------------------- kubectl / helm wrappers
@@ -190,6 +218,109 @@ ensure_helm() {
   [ -x "$HELM" ] || die 2 "the helm tarball did not contain $_os-$_arch/helm"
 }
 # <<< shared:helm-bootstrap
+
+# ---------------------------------------------------------------- --bootstrap: single-node k3s (opt-in)
+cluster_reachable() { command -v kubectl >/dev/null 2>&1 && kc get --raw /readyz >/dev/null 2>&1; }
+
+# Point this run at k3s's kubeconfig (a root-only file; the installer is expected to run as root for --bootstrap).
+use_k3s_kubeconfig() {
+  KUBECONFIG="$K3S_KUBECONFIG"; export KUBECONFIG
+  case ":$PATH:" in *:/usr/local/bin:*) ;; *) PATH="$PATH:/usr/local/bin"; export PATH ;; esac
+}
+
+# poll_until SECONDS CMD...: run CMD every $POLL seconds until it succeeds (0) or SECONDS elapsed (1).
+poll_until() {
+  _pu_end=$(( $(date +%s) + $1 )); shift
+  while :; do
+    "$@" && return 0
+    [ "$(date +%s)" -lt "$_pu_end" ] || return 1
+    sleep "$POLL"
+  done
+}
+have_nodes() { [ -n "$(kc get nodes -o name 2>/dev/null)" ]; }
+have_ingressclass() { [ -n "$(kc get ingressclass -o name 2>/dev/null)" ]; }
+have_traefik() { [ -n "$(kc -n kube-system get deploy traefik -o name 2>/dev/null)" ]; }
+have_default_sc() { case "$(kc get storageclass -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null)" in *"|true"*) return 0 ;; *) return 1 ;; esac; }
+
+# Something already listening on 80/443 would leave k3s's bundled Traefik (host ports 80/443) Pending.
+check_ports_free() {
+  command -v ss >/dev/null 2>&1 || return 0
+  _busy="$(ss -ltn 2>/dev/null </dev/null | awk '{print $4}' | grep -E '[:.](80|443)$' | sort -u | tr '\n' ' ')"
+  [ -z "$_busy" ] || die 2 "ports 80/443 are already in use on this host (listening: $_busy). k3s's Traefik ingress needs them. Stop whatever listens there (a web server, another cluster's ingress) and re-run --bootstrap."
+}
+
+install_k3s() {
+  _v="${K3S_VERSION:-$PINNED_K3S_VERSION}"
+  _want="${APS_K3S_INSTALL_SHA256:-}"
+  if [ -z "$_want" ]; then
+    [ "$_v" = "$PINNED_K3S_VERSION" ] \
+      || die 2 "no embedded checksum for the k3s $_v installer (only $PINNED_K3S_VERSION); set APS_K3S_INSTALL_SHA256 to the sha256 of that tag's install.sh"
+    _want="$K3S_INSTALL_SHA256_PINNED"
+  fi
+  _url="${APS_K3S_INSTALL_URL:-https://raw.githubusercontent.com/k3s-io/k3s/$(printf '%s' "$_v" | sed 's/+/%2B/g')/install.sh}"
+  mk_tmp
+  say "Installing single-node k3s $_v (official installer script, sha256-verified)"
+  fetch "$_url" "$TMP/k3s-install.sh" || die 2 "download of the k3s installer from $_url failed"
+  [ "$(sha256_of "$TMP/k3s-install.sh")" = "$_want" ] \
+    || die 2 "checksum mismatch for the downloaded k3s installer; refusing to run it"
+  # The Traefik that k3s bundles is the ingress (see docs/install.md); nothing else is changed from the defaults.
+  INSTALL_K3S_VERSION="$_v" sh "$TMP/k3s-install.sh" </dev/null \
+    || die 2 "the k3s installer failed (see its output above). Nothing else was installed; fix the cause and re-run, or remove a half-installed k3s with k3s-uninstall.sh"
+}
+
+bootstrap() {
+  if cluster_reachable; then
+    say "--bootstrap: a Kubernetes cluster is already reachable (context $(kubectl config current-context 2>/dev/null </dev/null || echo '?')); not installing k3s"
+    return 0
+  fi
+  # A k3s that is already installed (an earlier --bootstrap): use its kubeconfig, never reinstall over it.
+  if [ -r "$K3S_KUBECONFIG" ] || command -v k3s >/dev/null 2>&1; then
+    use_k3s_kubeconfig
+    say "--bootstrap: k3s is already installed on this host; waiting for its API (not reinstalling)"
+    poll_until "$BOOT_WAIT" cluster_reachable \
+      || die 2 "k3s is installed but its API did not answer within ${BOOT_WAIT}s (kubeconfig $K3S_KUBECONFIG). Start it (systemctl start k3s) or look at: journalctl -u k3s. --bootstrap does not reinstall over an existing k3s."
+    BOOTSTRAPPED=k3s-existing
+  else
+    [ "$(uname -s)" = Linux ] || die 2 "--bootstrap installs k3s and only supports Linux hosts (this is $(uname -s)). Use any existing Kubernetes cluster instead."
+    [ "${APS_TEST_UID:-$(id -u)}" = 0 ] || die 2 "--bootstrap installs k3s system-wide and needs root. Re-run as root, for example: curl -sfL <url>/install.sh | sudo sh -s -- --bootstrap [flags]"
+    check_ports_free
+    _arch="$(uname -m)"
+    case "$_arch" in x86_64|amd64) ;; *) warn "this host is $_arch: the published images are linux/amd64 only, pods will not start here." ;; esac
+    if [ -z "$ASSUME_YES" ] && ( : <"$TTY_DEV" ) 2>/dev/null; then
+      printf 'No Kubernetes cluster is reachable. Install single-node k3s %s on this host? [y/N] ' "${K3S_VERSION:-$PINNED_K3S_VERSION}" >&2
+      _ans=""
+      read -r _ans <"$TTY_DEV" || _ans=""
+      case "$_ans" in y|Y|yes|YES) ;; *) die 2 "aborted by the user" ;; esac
+    fi
+    install_k3s
+    use_k3s_kubeconfig
+    BOOTSTRAPPED=k3s-installed
+  fi
+  command -v kubectl >/dev/null 2>&1 || die 2 "k3s is installed but no kubectl was found on PATH (expected /usr/local/bin/kubectl)"
+  say "Waiting for the k3s node to become Ready (up to ${BOOT_WAIT}s)"
+  poll_until "$BOOT_WAIT" have_nodes || die 2 "no Kubernetes node registered within ${BOOT_WAIT}s. Look at: journalctl -u k3s"
+  kc wait --for=condition=Ready node --all --timeout="${BOOT_WAIT}s" >/dev/null 2>&1 \
+    || die 2 "the k3s node did not become Ready within ${BOOT_WAIT}s. Look at: kubectl get nodes; journalctl -u k3s"
+  # Traefik and the default StorageClass are deployed by k3s asynchronously; the chart needs both. A miss is not fatal
+  # (the install still works, with a warning from the preflight) but waiting here saves a confusing first-run delay.
+  poll_until "$BOOT_WAIT" have_default_sc || warn "k3s has no default StorageClass yet; volumes may stay Pending"
+  if poll_until "$BOOT_WAIT" have_traefik; then
+    kc -n kube-system rollout status deploy/traefik --timeout="${BOOT_WAIT}s" >/dev/null 2>&1 \
+      || warn "k3s's Traefik ingress is not ready yet; the UI may take a minute longer to answer"
+  fi
+  poll_until "$BOOT_WAIT" have_ingressclass || warn "k3s has no IngressClass yet"
+  say "k3s is ready (kubeconfig $K3S_KUBECONFIG)"
+}
+
+# The host's primary address, for the final URL when the Ingress carries none (bootstrap only).
+host_ip() {
+  _hip="${APS_HOST_IP:-}"   # explicit override (also the test seam)
+  if [ -z "$_hip" ] && command -v hostname >/dev/null 2>&1; then _hip="$(hostname -I 2>/dev/null </dev/null | awk '{print $1}')"; fi
+  if [ -z "$_hip" ] && command -v ip >/dev/null 2>&1; then
+    _hip="$(ip -4 route get 1.1.1.1 2>/dev/null </dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)"
+  fi
+  printf '%s' "$_hip"
+}
 
 # ---------------------------------------------------------------- preflight
 confirm() {
@@ -363,6 +494,8 @@ discover_url() {
 $_i
 EOF
   _addr="${_host:-${_ip:-$_hn}}"
+  # k3s's Traefik answers on every node address through its host ports 80/443.
+  [ -n "$_addr" ] || { [ -z "$BOOTSTRAPPED" ] || _addr="$(host_ip)"; }
   [ -n "$_addr" ] || return 0
   _scheme=http
   case "$_tls" in ""|"[]") ;; *) _scheme=https ;; esac
@@ -471,6 +604,15 @@ MSG
   Uninstall (keeps data):    curl -sfL $UNINSTALL_URL | sh -s -- -n $NS --release $REL --yes
                              (add --purge-data to delete the database and stored frames too)
 MSG
+  if [ -n "$BOOTSTRAPPED" ]; then
+    cat <<MSG
+
+  This host runs single-node k3s (installed by --bootstrap):
+    kubectl:                 export KUBECONFIG=$K3S_KUBECONFIG   (root-only file; or: sudo k3s kubectl ...)
+    Remove k3s as well:      curl -sfL $UNINSTALL_URL | sudo sh -s -- --remove-k3s --purge-indexes --yes
+                             (deletes the whole single-node cluster and everything stored in it)
+MSG
+  fi
 }
 
 post_install() {
@@ -485,6 +627,7 @@ main() {
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  [ -z "$BOOTSTRAP" ] || bootstrap
   preflight
   ensure_helm
   check_release_state
