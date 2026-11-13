@@ -29,7 +29,8 @@ kubeconfig, writes only to a temporary directory it removes on exit, and runs `h
 | `--values FILE`, `--set K=V` | Helm values, repeatable, applied in the order given |
 | `--chart DIR\|TGZ`, `--chart-url URL`, `--version V` | install a local or downloaded chart instead of the published OCI chart |
 | `--context NAME` | kubectl/helm context (`KUBECONFIG` is honoured) |
-| `--url URL` | the address this machine reaches the cluster at (an IP becomes `aps.<ip>.sslip.io` as the public name); overrides Traefik discovery |
+| `--url URL` | the address this machine reaches the cluster at (an IP becomes `aps.<ip>.sslip.io` as the public name); overrides Traefik discovery. `--url https://NAME[:PORT]` with no `tls.mode` and no certificate configured means TLS ends in front of the cluster: the installer sets `tls.mode=upstream`, `routes.host=NAME` and says so |
+| `--no-traefik-changes` | never modify a Traefik you reuse: with one host name (below) the installer stops before installing and prints the exact change instead |
 | `--no-identity-values` | do not generate the identity host values (Zitadel external domain, Argo SSO): you supply them (see Names) |
 | `--timeout DUR`, `--wait-indexes[=DUR]` | readiness budget; optionally wait for the astrometry indexes on every node |
 | `--helm-version V` | pinned helm to download when none >= 3.14 is on `PATH` |
@@ -98,7 +99,7 @@ directory and verifies it against a SHA-256 table embedded in the script (not fe
    the first-user instructions, and the upgrade/uninstall commands.
 
 Exit codes: 0 ok, 2 preflight or usage problem (nothing installed), 3 Helm failed (status and warning events are printed), 4 the
-app did not become ready in time.
+app did not become ready in time, or sign-in cannot work (the identity provider is not served where browsers are sent).
 
 ### Names: hosts, ports and TLS
 
@@ -119,11 +120,26 @@ enough for a local kind cluster reached on localhost.
 
 **One host name only.** Where you can have only one name, serve the identity provider on the same host at another port:
 `--set identity.host=aps.example.org:8443` (instead of the default sub-host `id.<routes.host>`). Zitadel's external port becomes
-that port, the issuer is `<scheme>://aps.example.org:8443`, and Traefik needs an entrypoint on it: the Traefik this chart installs
-gets one (`traefikController.ports.identity`, written by the installer / `identity-values.sh --id-host aps.example.org:8443`); a
-Traefik you reuse needs an entrypoint named `identity` (`traefik.entryPoints.identity` renames it) on that port, for example in
-k3s a `HelmChartConfig` adding `additionalArguments: ["--entrypoints.identity.address=:8443/tcp"]` and a Service port 8443.
-The port must be reachable by browsers and by nothing else is needed in-cluster.
+that port, the issuer is `<scheme>://aps.example.org:8443`, and Traefik needs an entrypoint on it (named `identity`;
+`traefik.entryPoints.identity` renames it). This is automatic:
+
+- The Traefik this chart installs gets the entrypoint (`traefikController.ports.identity`, written by the installer / `identity-values.sh --id-host aps.example.org:8443`).
+- A Traefik you **reuse** is inspected before anything is installed. If it already has the entrypoint nothing changes. Otherwise the
+  installer adds it, announces it in its output, and waits for the rollout, by the supported mechanism of how that Traefik was installed:
+  - **Installed by the official Traefik Helm chart** (microk8s's ingress addon is one): `helm upgrade <its release> traefik --repo https://traefik.github.io/charts --version <its current chart version> --reuse-values`
+    with `ports.identity.port` (+ `hostPort` when its `web` port uses a hostPort, else `exposedPort` and `expose`), and for a
+    DaemonSet/Deployment on hostPorts `updateStrategy.rollingUpdate.maxSurge=0, maxUnavailable=1` (the default surge pod cannot bind the
+    ports the old pod holds). It never uses `--wait` (a LoadBalancer Service without an address, as on microk8s, would never be ready). Nothing is added to your Helm
+    repositories; `APS_TRAEFIK_CHART_REPO` points at a mirror.
+  - **k3s's bundled Traefik**: a `HelmChartConfig` named `traefik` in `kube-system`. An existing one is merged (the `identity` block goes under its
+    `ports:`; other keys and fields stay); if its `ports:` is written inline (`ports: {...}`) the installer stops and tells you instead.
+  - **Anything else**: the installer stops before installing (exit 2) with the exact change: the argument `--entryPoints.identity.address=:<port>/tcp` and the port to publish.
+  - `--no-traefik-changes` turns the first two into that same error.
+- The public port must be reachable by browsers; on a host behind a TLS proxy see the next paragraph. Ports below 1024 use container port `10000 + port`.
+
+After the install the installer checks that sign-in can work: the entrypoint exists, and the identity provider's discovery document
+(`/.well-known/openid-configuration`) answers through Traefik with the identity Host header. If not, it prints the diagnosis and exits 4 instead of
+announcing success.
 
 **TLS.** Passkeys (WebAuthn) and `Secure` cookies need HTTPS: without `tls.mode` the session cookie is not `Secure` and browsers
 refuse passkey enrolment (TOTP works). The no-TLS path is meant for home labs; with `tls.mode=certManager` the Certificate covers
@@ -139,6 +155,21 @@ cluster nothing needs the public certificate: apsd and the bootstrap Job reach Z
 `Host` and `X-Forwarded-Proto: https`, and the Argo pod's forwarder terminates TLS itself with a throwaway certificate (Argo skips
 verifying it, `sso.insecureSkipVerify`). The installer's identity values follow `--set tls.mode=upstream` (with plain Helm pass
 `--tls-upstream` to `identity-values.sh`).
+
+The installer cannot configure the proxy / tunnel, but it tells you exactly what to map. At the end it prints, with the real addresses
+of this cluster's Traefik (a hostPort on the node, a NodePort, or the Service's load balancer):
+
+```
+https://aps.example.org:443    ->  http://<node address>:80     (Traefik's `web` entrypoint)
+https://aps.example.org:8444   ->  http://<node address>:8444   (Traefik's `identity` entrypoint; only with identity.host=NAME:8444)
+```
+
+(with the default sub-host, `https://id.aps.example.org:443` goes to the same `web` entrypoint as the app), plus a Caddy line as an
+example. It first tries `https://<identity host>/.well-known/openid-configuration` from the installing machine: if that answers, the
+mapping works and it says so; if not, the mapping is printed as a **REQUIRED** step, the install still ends with exit 0 and a warning
+(it cannot test your edge from inside), and a failure that is not just the missing mapping exits 4. A TLS proxy running on the same host cannot
+listen on a port that Traefik holds as a hostPort (the identity port, e.g. 8444): use a tunnel or another host for it.
+`tls.mode` is also read from `-f` values files (plain `key: value` lines, as `routes.host`, `routes.port` and `identity.host`).
 
 ### Identity (who you are)
 
@@ -391,6 +422,8 @@ indexes and the label yourself with `plateSolve.indexSource.mode=preSeeded`.
 | A node keeps an image under two names after switching registries | the kubelet image record gotcha: on that node `crictl rmi <both names>` (or `microk8s ctr images rm`) and let it pull again. Do not mix a registry-qualified and an imported tag of the same image on one node. |
 | UI loads but uploads fail with 413 | the size limit is `routes.maxBodySize` (apsd's own, default 2g); a proxy or load balancer in front of Traefik may have a lower one. |
 | Uploads or event streams are cut after 60 s | the entrypoint timeouts of a Traefik you reuse: see "Timeouts on a Traefik you reuse". |
+| The install stops with "Traefik ... has no entrypoint \"identity\" on port ..." | `--no-traefik-changes` was given, or that Traefik is not Helm-installed / k3s's: make the change it prints (argument + published port), then re-run. See One host name only. |
+| Sign-in redirects to `https://<host>:<port>` and nothing answers | the identity port is not mapped: with `tls.mode=upstream` your TLS proxy / tunnel must forward that public port to Traefik's `identity` entrypoint (the installer prints the exact mapping); otherwise the port is not open on the node (firewall). |
 | `helm` fails with "a Traefik controller is already running" | a plain `helm install` found another Traefik: add `--set traefik.install=false` (or use `install.sh`, which decides). |
 | The install finished but the printed URL does not open | the script checked apsd through a port-forward and warned that the Traefik address does not answer from the installing machine: check DNS/firewall and that Traefik has an address (`kubectl get svc -A -l app.kubernetes.io/name=traefik`), or use the `port-forward` command it prints. |
 | The page redirects to the identity provider and the browser cannot resolve `id.<host>` | both names must resolve for the browser: DNS, `/etc/hosts`, or the `sslip.io` default. `*.localhost` and `*.localtest.me` resolve to loopback. |

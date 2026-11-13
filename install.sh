@@ -12,12 +12,13 @@
 #   curl -sfL <url>/install.sh | sudo sh -s -- --bootstrap --yes
 # Without the flag this script never installs Kubernetes.
 #
-# Exit codes: 0 ok | 2 preflight / usage | 3 helm failed | 4 timed out waiting for the app.
+# Exit codes: 0 ok | 2 preflight / usage | 3 helm failed (or the change to a reused Traefik failed) | 4 timed out waiting for
+# the app, or sign-in cannot work (the identity provider is not served).
 
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.3.0" # @version
+DEFAULT_VERSION="0.3.1" # @version
 
 # --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
 # TAG, live here on purpose (a checksum fetched from the host that serves the script proves nothing). The script is
@@ -55,6 +56,8 @@ Usage: install.sh [flags]
   --dry-run              pass --dry-run to helm (nothing is installed)
   --no-identity-values   do not generate the identity host values (routes.host, identity.host, the Zitadel external domain and the
                          Argo SSO settings): you pass them yourself (deploy/helm/identity-values.sh writes them; see docs/install.md)
+  --no-traefik-changes   never modify a Traefik you reuse: when identity.host has its own port (one host name) and that Traefik lacks
+                         the `identity` entrypoint, stop before installing and print the exact change instead (env APS_NO_TRAEFIK_CHANGES=1)
   --adopt-argo-crds      proceed although Argo Workflows CRDs already exist on the cluster (they will be
                          overwritten with this chart's Argo version)
   --help, -h             this text
@@ -66,9 +69,13 @@ the address. Upgrades keep the host the release already has.
 
 Traefik: the app is published through Traefik (IngressRoutes). Before installing, this script looks for a running Traefik
 (its CRDs plus a controller): found -> it is reused (traefik.install=false), none -> the chart installs one (true). The
-decision is printed. Force it with --set traefik.install=true|false.
+decision is printed. Force it with --set traefik.install=true|false. With one host name (--set identity.host=HOST:PORT) a
+reused Traefik needs an entrypoint named identity on that port: this script adds it (a Helm-installed Traefik is upgraded with
+`helm upgrade --reuse-values`; k3s's bundled one gets a HelmChartConfig) and says so; --no-traefik-changes turns that into an error
+with the exact instruction. --url https://NAME with no tls.mode and no in-cluster certificate means tls.mode=upstream (TLS ends in
+front of the cluster); the port mapping the TLS proxy or tunnel then needs is printed at the end.
 
-Exit codes: 0 ok, 2 preflight or usage, 3 helm failed, 4 timed out waiting for the app.
+Exit codes: 0 ok, 2 preflight or usage, 3 helm failed, 4 timed out waiting for the app or sign-in cannot work.
 USAGE
 }
 
@@ -119,6 +126,10 @@ WAIT_INDEXES=0
 DRY_RUN=""
 ADOPT_CRDS=""
 NO_IDENTITY_VALUES=""
+NO_TRAEFIK_CHANGES="${APS_NO_TRAEFIK_CHANGES:-}"
+TRAEFIK_CHART_REPO="${APS_TRAEFIK_CHART_REPO:-https://traefik.github.io/charts}"   # the official Traefik chart repository (mirrors: set this)
+PROBE_WAIT="${APS_PROBE_WAIT:-30}"                                                  # seconds the sign-in probes keep trying
+TRAEFIK_REUSED=""; TRAEFIK_CTL=""; TLS_INFERRED=""
 PLAIN_HTTP="${APS_PLAIN_HTTP:-}"
 BOOTSTRAP="${APS_BOOTSTRAP:-}"
 K3S_VERSION="${APS_K3S_VERSION:-}"
@@ -153,6 +164,7 @@ parse_args() {
       --yes|-y) ASSUME_YES=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       --no-identity-values) NO_IDENTITY_VALUES=1; shift ;;
+      --no-traefik-changes) NO_TRAEFIK_CHANGES=1; shift ;;
       --adopt-argo-crds) ADOPT_CRDS=1; shift ;;
       --plain-http) PLAIN_HTTP=1; shift ;;
       --bootstrap) BOOTSTRAP=1; shift ;;
@@ -420,7 +432,10 @@ traefik_controllers() { # "namespace/name" of every Traefik Deployment/DaemonSet
 resolve_traefik() {
   TRAEFIK_VALUES=""
   case "$HELM_USER" in
-    *traefik.install=*) say "Traefik: traefik.install was given on the command line; using it as is"; return 0 ;;
+    *traefik.install=*)
+      say "Traefik: traefik.install was given on the command line; using it as is"
+      if [ "$(user_value traefik install)" = false ]; then TRAEFIK_REUSED=1; TRAEFIK_CTL="$(traefik_controllers | head -n 1)"; fi
+      return 0 ;;
   esac
   _ctl="$(traefik_controllers)"
   _first="$(printf '%s\n' "$_ctl" | head -n 1)"
@@ -428,7 +443,7 @@ resolve_traefik() {
     _ti=true
     say "Traefik: $NS/$REL-traefik belongs to this release; keeping it (traefik.install=true)"
   elif [ -n "$_first" ] && have_traefik_crd; then
-    _ti=false
+    _ti=false; TRAEFIK_REUSED=1; TRAEFIK_CTL="$_first"
     say "Traefik: found $_first with its CRDs; reusing it (traefik.install=false), nothing will be installed"
   elif [ -n "$_first" ]; then
     _ti=true
@@ -511,6 +526,26 @@ set_value() {
   printf '%s' "$HELM_USER" | tr ' ' '\n' | sed -n "s/^'$1=\(.*\)'\$/\1/p" | tail -n 1
 }
 
+# file_value TOP KEY FILE: TOP.KEY from a values file (two-level keys, plain `key: value` lines; "" if absent). The installer
+# deliberately does not run a YAML parser: flow style, anchors and deeper nesting are not read (pass those with --set).
+file_value() {
+  awk -v top="$1" -v key="$2" '
+    /^[^ #]/ { in_top = ($0 == top ":"); next }
+    in_top && $1 == key ":" { v = $0; sub(/^[^:]*: */, "", v); sub(/[ \t]+#.*$/, "", v); gsub(/^["\047]|["\047]$/, "", v); print v; exit }' "$3" 2>/dev/null
+}
+
+# user_value TOP KEY: what the user passed for TOP.KEY: --set wins (as in Helm), else the last -f file that has it.
+user_value() {
+  _uv="$(set_value "$1.$2")"
+  if [ -z "$_uv" ]; then
+    for _uf in $(printf '%s' "$HELM_USER" | tr ' ' '\n' | sed -n "/^'-f'\$/{n;s/^'\(.*\)'\$/\1/p;}"); do
+      _fv="$(file_value "$1" "$2" "$_uf")"
+      [ -z "$_fv" ] || _uv="$_fv"
+    done
+  fi
+  printf '%s' "$_uv"
+}
+
 # release_value TOP KEY: TOP.KEY from the installed release's user-supplied values ("" if none).
 release_value() {
   hm get values "$REL" -n "$NS" -o yaml 2>/dev/null | awk -v top="$1" -v key="$2" '
@@ -530,19 +565,46 @@ default_host() {
   [ -z "$_dip" ] || printf 'aps.%s.sslip.io' "$_dip"
 }
 
+# cert_config_given: the user configured a certificate for the cluster's own Traefik (tls.secretName / tls.certManager.*).
+cert_config_given() {
+  case "$HELM_USER" in *tls.secretName=?*|*tls.certManager.*=?*) return 0 ;; esac
+  for _cf in $(printf '%s' "$HELM_USER" | tr ' ' '\n' | sed -n "/^'-f'\$/{n;s/^'\(.*\)'\$/\1/p;}"); do
+    grep -Eq '^[[:space:]]+(secretName|issuerRef):[[:space:]]*[^[:space:]]' "$_cf" 2>/dev/null && return 0
+  done
+  return 1
+}
+
 # The identity host values (see aps_identity_values): generated into a file placed before the user's -f, so what the user sets wins.
 resolve_identity() {
   ID_VALUES=""; ID_PORT=""; PUBLIC_HOST=""
   if [ -n "$NO_IDENTITY_VALUES" ]; then say "Identity: --no-identity-values; the identity host values are yours"; return 0; fi
   case "$HELM_USER" in *ExternalDomain=*|*identity.mode=external*) say "Identity: given on the command line; using it as is"; return 0 ;; esac
-  _h="$(set_value routes.host)"; _p="$(set_value routes.port)"; _tm="$(set_value tls.mode)"
-  if [ -z "$_h" ] && [ -n "$URL_OVERRIDE" ]; then
-    # --url http://host[:port] says it all; an IP address cannot carry the identity provider's own name, so it becomes
-    # aps.<ip>.sslip.io (the URL is still where this machine reaches the cluster)
+  _h="$(user_value routes host)"; _p="$(user_value routes port)"; _tm="$(user_value tls mode)"
+  if [ -n "$URL_OVERRIDE" ]; then
     _u="${URL_OVERRIDE#*://}"; _u="${_u%%/*}"
-    _h="${_u%%:*}"; case "$_u" in *:*) _p="${_u##*:}" ;; esac
-    case "$URL_OVERRIDE" in https://*) [ -n "$_tm" ] || _tm=secret ;; esac
-    case "$_h" in *[!0-9.]*|"") ;; *.*.*.*) _h="aps.$_h.sslip.io" ;; esac
+    _uh="${_u%%:*}"; _up=""; case "$_u" in *:*) _up="${_u##*:}" ;; esac
+    case "$URL_OVERRIDE" in
+      https://*)
+        if [ -z "$_tm" ]; then
+          # https with no certificate configured in the cluster: the TLS ends in front of Traefik (a proxy, a tunnel, a load
+          # balancer). A name is required (an address cannot be a certificate's host); an existing release keeps its own mode.
+          _isip=""; case "$_uh" in *[!0-9.]*|"") ;; *) _isip=1 ;; esac
+          if [ -z "$_isip" ] && { [ -z "$_h" ] || [ "$_h" = "$_uh" ]; } && ! cert_config_given && [ -z "$(release_value tls mode)" ]; then
+            _tm=upstream; TLS_INFERRED=upstream; [ -n "$_h" ] || _h="$_uh"; [ -n "$_p" ] || _p="$_up"
+            add_user "--set"; add_user "tls.mode=upstream"
+            say "TLS: --url is https://$_uh$([ -z "$_up" ] || printf ':%s' "$_up") and no certificate is configured in the cluster: assuming TLS ends in front of Traefik (tls.mode=upstream, routes.host=$_uh). For a certificate in the cluster pass --set tls.mode=certManager|secret."
+          else
+            # an existing release keeps its own mode (a re-run with the same --url must not flip upstream to secret)
+            _tm="$(release_value tls mode)"; [ -n "$_tm" ] || _tm=secret
+          fi
+        fi ;;
+    esac
+    if [ -z "$_h" ]; then
+      # --url http://host[:port] says it all; an IP address cannot carry the identity provider's own name, so it becomes
+      # aps.<ip>.sslip.io (the URL is still where this machine reaches the cluster)
+      _h="$_uh"; [ -z "$_up" ] || _p="$_up"
+      case "$_h" in *[!0-9.]*|"") ;; *.*.*.*) _h="aps.$_h.sslip.io" ;; esac
+    fi
   fi
   if [ -z "$_h" ] && [ -n "$(release_value identity host)" ]; then
     ID_PORT="$(release_value routes port)"
@@ -559,7 +621,7 @@ resolve_identity() {
   _tls=0; case "$_tm" in ""|none) ;; upstream) _tls=upstream ;; *) _tls=1 ;; esac
   _argo=path
   case "$HELM_USER" in *argoUI.enabled=false*) _argo=off ;; esac
-  _ah="$(set_value argoUI.host)"; [ -z "$_ah" ] || _argo="host=$_ah"
+  _ah="$(user_value argoUI host)"; [ -z "$_ah" ] || _argo="host=$_ah"
   _target=""
   if [ "$_tls" = 1 ] && [ "${_ti:-$(set_value traefik.install)}" != true ]; then
     _ts="$(kc get svc -A -l app.kubernetes.io/name=traefik -o 'jsonpath={range .items[*]}{.metadata.name}.{.metadata.namespace}.svc{"\n"}{end}' 2>/dev/null | head -n 1)"
@@ -568,7 +630,7 @@ resolve_identity() {
   mk_tmp
   ID_VALUES="$TMP/identity-hosts.yaml"
   ID_PORT="$_p"
-  aps_identity_values "$_h" "$(set_value identity.host)" "$_p" "$_tls" "$_argo" "$_target" "$REL" > "$ID_VALUES" || die 2 "could not generate the identity values"
+  aps_identity_values "$_h" "$(user_value identity host)" "$_p" "$_tls" "$_argo" "$_target" "$REL" > "$ID_VALUES" || die 2 "could not generate the identity values"
 }
 
 # An interrupted release (pending-install/upgrade/rollback) cannot be upgraded; never auto-delete release Secrets.
@@ -579,6 +641,306 @@ check_release_state() {
       pending-*)
         die 2 "release \"$REL\" is stuck in state $_state (an earlier run was interrupted). Recover with one of: 'helm rollback $REL -n $NS' (when an earlier revision exists) or 'helm uninstall $REL -n $NS' (your data volumes and Secret are kept), then re-run this installer. Nothing was changed." ;;
     esac
+  fi
+}
+
+# ---------------------------------------------------------------- the identity provider's own port on a reused Traefik
+# With one host name (identity.host=NAME:PORT) the browser is sent to NAME:PORT for sign-in, so Traefik needs an entrypoint on
+# that port (named traefik.entryPoints.identity, default "identity"). The Traefik this chart installs gets one; a Traefik that is
+# reused gets it HERE, before anything is installed, by the supported mechanism of how it was installed:
+#   k3s's bundled Traefik   -> a HelmChartConfig in kube-system (merged into the user's, never replaced)
+#   any Helm-installed one  -> helm upgrade <its release> --reuse-values (microk8s's ingress addon is one)
+#   anything else           -> stop with the exact change to make (exit 2), as does --no-traefik-changes.
+
+# facts about the names, from what the user passed, the generated values and the existing release
+identity_facts() {
+  IDENTITY_CHECK=""; IDNAME=""; ID_OWNPORT=""; ID_CPORT=""; FACT_HOST=""
+  WEB_EP="$(set_value traefik.entryPoints.http)"; WEB_EP="${WEB_EP:-web}"
+  ID_EP="$(set_value traefik.entryPoints.identity)"; ID_EP="${ID_EP:-identity}"
+  TLS_MODE="$(user_value tls mode)"; [ -n "$TLS_MODE" ] || TLS_MODE="$TLS_INFERRED"; [ -n "$TLS_MODE" ] || TLS_MODE="$(release_value tls mode)"
+  [ "$(user_value identity mode)" != external ] || return 0
+  case "$HELM_USER" in *idp.enabled=false*) return 0 ;; esac
+  FACT_HOST="${PUBLIC_HOST:-$(user_value routes host)}"
+  [ -n "$FACT_HOST" ] || FACT_HOST="$(release_value routes host)"
+  _ih="$(user_value identity host)"
+  [ -n "$_ih" ] || [ -z "$ID_VALUES" ] || _ih="$(file_value identity host "$ID_VALUES")"
+  [ -n "$_ih" ] || _ih="$(release_value identity host)"
+  [ -n "$_ih" ] || { [ -z "$FACT_HOST" ] || _ih="id.$FACT_HOST"; }
+  [ -n "$_ih" ] || return 0
+  case "$_ih" in *:*) ID_OWNPORT="${_ih##*:}"; IDNAME="${_ih%:*}" ;; *) IDNAME="$_ih" ;; esac
+  case "$ID_OWNPORT" in *[!0-9]*) ID_OWNPORT="" ;; esac
+  ID_CPORT="$ID_OWNPORT"
+  { [ -z "$ID_OWNPORT" ] || [ "$ID_OWNPORT" -ge 1024 ]; } || ID_CPORT=$((10000 + ID_OWNPORT))
+  IDENTITY_CHECK=1
+}
+
+# pick_service: of the Services described on stdin ("S|name|type|lbip" then "P|port name|port|targetPort|nodePort" lines) keep
+# the first that is not a ClusterIP one (else the first).
+pick_service() {
+  awk -F'|' '
+    $1 == "S" { n++; blk[n] = $0; t[n] = $3; next }
+    $1 == "P" && n { blk[n] = blk[n] "\n" $0 }
+    END { pick = 0; for (i = 1; i <= n; i++) if (t[i] != "ClusterIP" && !pick) pick = i; if (!pick && n) pick = 1; if (pick) print blk[pick] }'
+}
+
+# tf_reload: re-read the controller's arguments (TF_ARGS), published ports (TF_PORTS) and Service (TF_SVC).
+tf_reload() {
+  TF_ARGS="$(kc -n "$TF_NS" get "$TF_RES" -o 'jsonpath={range .spec.template.spec.containers[0].args[*]}{@}{"\n"}{end}' 2>/dev/null)"
+  TF_PORTS="$(kc -n "$TF_NS" get "$TF_RES" -o 'jsonpath={range .spec.template.spec.containers[0].ports[*]}{.name}|{.containerPort}|{.hostPort}{"\n"}{end}' 2>/dev/null)"
+  TF_SVC="$(kc -n "$TF_NS" get svc -l app.kubernetes.io/name=traefik -o 'jsonpath={range .items[*]}S|{.metadata.name}|{.spec.type}|{.status.loadBalancer.ingress[0].ip}{"\n"}{range .spec.ports[*]}P|{.name}|{.port}|{.targetPort}|{.nodePort}{"\n"}{end}{end}' 2>/dev/null | pick_service)"
+}
+
+# tf_load NS NAME: TF_KIND TF_REL TF_RELNS TF_CHART (Helm ownership and chart of the controller) + tf_reload; 1 when not found.
+tf_load() {
+  TF_NS="$1"; TF_NAME="$2"; TF_KIND=""; TF_REL=""; TF_RELNS=""; TF_CHART=""; TF_ARGS=""; TF_PORTS=""; TF_SVC=""; TF_RES=""
+  _rows="$(kc get deploy,ds -A -l app.kubernetes.io/name=traefik -o 'jsonpath={range .items[*]}{.metadata.namespace}|{.metadata.name}|{.kind}|{.metadata.annotations.meta\.helm\.sh/release-name}|{.metadata.annotations.meta\.helm\.sh/release-namespace}|{.metadata.labels.helm\.sh/chart}{"\n"}{end}' 2>/dev/null | grep -F "$1|$2|" | head -n 1)"
+  [ -n "$_rows" ] || return 1
+  IFS='|' read -r _tx _ty TF_KIND TF_REL TF_RELNS TF_CHART <<EOF
+$_rows
+EOF
+  TF_RES="$(printf '%s' "$TF_KIND" | tr 'A-Z' 'a-z')/$TF_NAME"
+  tf_reload
+}
+
+# tf_locate: load the Traefik that serves this release (the reused one, else the chart's own).
+tf_locate() {
+  if [ "$TRAEFIK_REUSED" = 1 ]; then _lc="$TRAEFIK_CTL"; else _lc="$NS/$REL-traefik"; fi
+  [ -n "$_lc" ] || return 1
+  tf_load "${_lc%%/*}" "${_lc#*/}"
+}
+
+# tf_cport NAME: the container port of entrypoint NAME ("" when it does not exist), from --entryPoints.NAME.address=[host]:PORT[/proto]
+tf_cport() {
+  printf '%s\n' "$TF_ARGS" | awk -v n="$1" '
+    BEGIN { p = tolower("--entryPoints." n ".address=") }
+    index(tolower($0), p) == 1 { a = substr($0, length(p) + 1); sub(/^[^:]*:/, "", a); sub(/[^0-9].*$/, "", a); print a; exit }'
+}
+# tf_hostport NAME: the hostPort published for the container port named NAME (or numbered like the entrypoint), if any
+tf_hostport() {
+  _hc="$(tf_cport "$1")"
+  printf '%s\n' "$TF_PORTS" | awk -F'|' -v n="$1" -v c="$_hc" '($1 == n || (c != "" && $2 == c)) && $3 != "" && $3 != 0 { print $3; exit }'
+}
+# tf_svcport NAME: "port|nodePort" of the Service port that leads to entrypoint NAME ("" when none)
+tf_svcport() {
+  _sc="$(tf_cport "$1")"
+  printf '%s\n' "$TF_SVC" | awk -F'|' -v n="$1" -v c="$_sc" '$1 == "P" && ($2 == n || $4 == n || (c != "" && $4 == c)) { print $3 "|" $5; exit }'
+}
+
+node_addr() {
+  _na="$(kc get nodes -o 'jsonpath={range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null | grep .)"
+  if [ "$(printf '%s\n' "$_na" | grep -c .)" = 1 ]; then printf '%s' "$_na"; else printf '<node-address>'; fi
+}
+
+# tf_ep_target NAME: sets EP_URL (where a proxy reaches entrypoint NAME: plain HTTP) and EP_NOTE.
+tf_ep_target() {
+  EP_URL=""; EP_NOTE=""
+  _ec="$(tf_cport "$1")"
+  if [ -z "$_ec" ]; then EP_NOTE="Traefik's \"$1\" entrypoint (its address could not be determined)"; return 0; fi
+  _eh="$(tf_hostport "$1")"
+  _esp="$(tf_svcport "$1")"; _esvc="$(printf '%s\n' "$TF_SVC" | sed -n '1{s/^S|\([^|]*\)|.*/\1/p;}')"
+  _elb="$(printf '%s\n' "$TF_SVC" | sed -n '1{s/^S|[^|]*|[^|]*|\(.*\)$/\1/p;}')"
+  if [ -n "$_eh" ]; then
+    EP_URL="http://$(node_addr):$_eh"; EP_NOTE="Traefik entrypoint \"$1\": hostPort $_eh on every node that runs Traefik"
+  elif [ -n "$_elb" ] && [ -n "$_esp" ]; then
+    EP_URL="http://$_elb:${_esp%%|*}"; EP_NOTE="Traefik entrypoint \"$1\": port ${_esp%%|*} of the Service's load balancer"
+  elif [ -n "$_esp" ] && [ -n "${_esp#*|}" ]; then
+    EP_URL="http://$(node_addr):${_esp#*|}"; EP_NOTE="Traefik entrypoint \"$1\": NodePort ${_esp#*|} of Service $_esvc, on every node"
+  else
+    EP_NOTE="Traefik entrypoint \"$1\" (container port $_ec): no hostPort, load balancer or NodePort reaches it yet, so expose it first"
+  fi
+}
+
+# tf_expose_set: the Helm --set key that publishes an entrypoint on the Service ("expose.default" since chart 34, a boolean before)
+tf_expose_set() {
+  _maj="${TF_CHART#traefik-}"; _maj="${_maj%%.*}"
+  case "$_maj" in ""|*[!0-9]*) _maj=99 ;; esac
+  if [ "$_maj" -ge 34 ]; then printf 'ports.%s.expose.default=true' "$ID_EP"; else printf 'ports.%s.expose=true' "$ID_EP"; fi
+}
+
+tf_manual() { # tf_manual WHY: fail before installing, with the change to make by hand
+  die 2 "Traefik $TF_NS/$TF_NAME has no entrypoint \"$ID_EP\" on port $ID_OWNPORT, which identity.host=$IDNAME:$ID_OWNPORT needs (browsers are sent there to sign in), and $1.
+Add it, then re-run this installer:
+  1. give the Traefik container the argument   --entryPoints.$ID_EP.address=:$ID_CPORT/tcp
+  2. publish port $ID_OWNPORT to container port $ID_CPORT (a hostPort, or a port on its Service)
+With the official Traefik Helm chart that is:
+  helm upgrade <release> traefik/traefik -n <namespace> --reuse-values --set ports.$ID_EP.port=$ID_CPORT --set ports.$ID_EP.exposedPort=$ID_OWNPORT --set ports.$ID_EP.expose.default=true
+(use --set ports.$ID_EP.hostPort=$ID_OWNPORT instead of expose when Traefik uses hostPorts, and do not use --wait on a LoadBalancer without an address).
+Or avoid the extra port: --set identity.host=id.${FACT_HOST:-<routes.host>} (a second host name, no entrypoint needed)."
+}
+
+tf_has_ep() { tf_reload; [ -n "$(tf_cport "$ID_EP")" ]; }
+
+# tf_wait_applied: the controller carries the entrypoint and has rolled out (a change may arrive asynchronously, as with k3s).
+tf_wait_applied() {
+  poll_until "$TIMEOUT_S" tf_has_ep \
+    || die 4 "the Traefik change was applied but $TF_NS/$TF_NAME did not get the \"$ID_EP\" entrypoint within $TIMEOUT. Look at: kubectl -n $TF_NS get $TF_RES -o yaml; kubectl -n $TF_NS get pods"
+  kc -n "$TF_NS" rollout status "$TF_RES" --timeout "$TIMEOUT" >&2 \
+    || die 4 "$TF_RES did not finish rolling out within $TIMEOUT. Look at: kubectl -n $TF_NS get pods -l app.kubernetes.io/name=traefik; kubectl -n $TF_NS describe pod -l app.kubernetes.io/name=traefik"
+  tf_has_ep || die 4 "$TF_RES rolled out without the \"$ID_EP\" entrypoint"
+}
+
+# (a) a Helm-installed Traefik: upgrade its own release in place. Never --wait (a LoadBalancer Service without an address, as on
+# microk8s, would never become ready); a DaemonSet or Deployment on hostPorts needs maxSurge=0 or its rolling update deadlocks
+# (the surged pod cannot bind the ports the old one holds). The chart repo is passed with --repo so no repository is added to the
+# user's Helm configuration, and Helm's caches live in the installer's temporary directory.
+tf_add_helm() {
+  case "$TF_CHART" in traefik-[0-9]*) ;; *) return 1 ;; esac
+  [ -n "$TF_REL" ] || return 1
+  _wh="$(tf_hostport "$WEB_EP")"
+  set -- upgrade "$TF_REL" traefik --repo "$TRAEFIK_CHART_REPO" --version "${TF_CHART#traefik-}" -n "${TF_RELNS:-$TF_NS}" --reuse-values \
+    --set "ports.$ID_EP.port=$ID_CPORT" --set "ports.$ID_EP.protocol=TCP"
+  if [ -n "$_wh" ]; then
+    set -- "$@" --set "ports.$ID_EP.hostPort=$ID_OWNPORT" --set updateStrategy.rollingUpdate.maxSurge=0 --set updateStrategy.rollingUpdate.maxUnavailable=1
+  else
+    set -- "$@" --set "ports.$ID_EP.exposedPort=$ID_OWNPORT" --set "$(tf_expose_set)"
+  fi
+  say "Traefik: adding the \"$ID_EP\" entrypoint (:$ID_CPORT, public port $ID_OWNPORT) to $TF_RES: helm upgrade of its release \"$TF_REL\" (namespace ${TF_RELNS:-$TF_NS}, chart $TF_CHART), values kept. Use --no-traefik-changes to be told instead."
+  say "  helm $*"
+  [ -z "$DRY_RUN" ] || { say "dry run: Traefik is not changed"; return 0; }
+  mk_tmp
+  ( export HELM_CACHE_HOME="$TMP/helm/cache" HELM_CONFIG_HOME="$TMP/helm/config" HELM_DATA_HOME="$TMP/helm/data"; hm "$@" ) \
+    || die 3 "helm could not upgrade the Traefik release \"$TF_REL\" (output above); nothing of this release was installed. Is $TRAEFIK_CHART_REPO reachable from here? Make the change by hand with --no-traefik-changes for the exact steps."
+  tf_wait_applied
+}
+
+# (b) k3s's bundled Traefik: a HelmChartConfig named traefik in kube-system (k3s's Helm controller applies it). An existing one
+# is merged, never replaced: our `identity` block goes under its `ports:` key (or a new `ports:` is appended); other fields of
+# the object (valuesSecrets, ...) stay, since `kubectl apply` only sets what is written.
+tf_is_k3s() {
+  [ "$TF_NS/$TF_NAME" = kube-system/traefik ] && kc -n kube-system get helmchart.helm.cattle.io traefik -o name >/dev/null 2>&1
+}
+tf_add_k3s() {
+  _cur="$(kc -n kube-system get helmchartconfig.helm.cattle.io traefik -o 'jsonpath={.spec.valuesContent}' 2>/dev/null)" || _cur=""
+  mk_tmp
+  _ind=2
+  _pi="$(printf '%s\n' "$_cur" | awk 'f && NF { match($0, /^ */); print RLENGTH; exit } /^ports:[ \t]*$/ { f = 1 }')"
+  [ -z "$_pi" ] || [ "$_pi" = 0 ] || _ind="$_pi"
+  _sp="$(awk -v n="$_ind" 'BEGIN { printf "%" n "s", "" }')"
+  _maj="${TF_CHART#traefik-}"; _maj="${_maj%%.*}"; case "$_maj" in ""|*[!0-9]*) _maj=99 ;; esac
+  {
+    printf '%s%s:\n%s  port: %s\n%s  exposedPort: %s\n%s  protocol: TCP\n' "$_sp" "$ID_EP" "$_sp" "$ID_CPORT" "$_sp" "$ID_OWNPORT" "$_sp"
+    if [ "$_maj" -ge 34 ]; then printf '%s  expose:\n%s    default: true\n' "$_sp" "$_sp"; else printf '%s  expose: true\n' "$_sp"; fi
+  } > "$TMP/hcc-block.yaml"
+  if printf '%s\n' "$_cur" | grep -Eq "^[[:space:]]+$ID_EP:[[:space:]]*\$"; then
+    say "Traefik: the HelmChartConfig kube-system/traefik already defines ports.$ID_EP; waiting for k3s to roll it out"
+    [ -n "$DRY_RUN" ] || tf_wait_applied
+    return 0
+  fi
+  if [ -z "$_cur" ]; then { printf 'ports:\n'; cat "$TMP/hcc-block.yaml"; } > "$TMP/hcc-values.yaml"
+  elif printf '%s\n' "$_cur" | grep -Eq '^ports:[[:space:]]*$'; then
+    printf '%s\n' "$_cur" | sed "/^ports:[[:space:]]*\$/r $TMP/hcc-block.yaml" > "$TMP/hcc-values.yaml"
+  elif printf '%s\n' "$_cur" | grep -Eq '^ports:'; then
+    return 1   # `ports:` in flow style or inline: not merged blindly
+  else { printf '%s\n' "$_cur"; printf 'ports:\n'; cat "$TMP/hcc-block.yaml"; } > "$TMP/hcc-values.yaml"
+  fi
+  {
+    printf 'apiVersion: helm.cattle.io/v1\nkind: HelmChartConfig\nmetadata:\n  name: traefik\n  namespace: kube-system\nspec:\n  valuesContent: |2-\n'
+    sed 's/^/    /' "$TMP/hcc-values.yaml"
+  } > "$TMP/hcc.yaml"
+  say "Traefik: adding the \"$ID_EP\" entrypoint (:$ID_CPORT, public port $ID_OWNPORT) to k3s's bundled Traefik through the HelmChartConfig kube-system/traefik$([ -z "$_cur" ] || printf ' (merged into yours)'). Use --no-traefik-changes to be told instead."
+  [ -z "$DRY_RUN" ] || { say "dry run: Traefik is not changed"; return 0; }
+  kc apply -f "$TMP/hcc.yaml" >&2 || die 3 "could not apply the HelmChartConfig kube-system/traefik; nothing of this release was installed"
+  tf_wait_applied
+}
+
+ensure_identity_entrypoint() {
+  [ "$IDENTITY_CHECK" = 1 ] && [ -n "$ID_OWNPORT" ] && [ "$TRAEFIK_REUSED" = 1 ] || return 0
+  if [ -z "$TRAEFIK_CTL" ] || ! tf_load "${TRAEFIK_CTL%%/*}" "${TRAEFIK_CTL#*/}"; then
+    warn "traefik.install=false but no Traefik controller was found; cannot check for the \"$ID_EP\" entrypoint (port $ID_OWNPORT)"
+    return 0
+  fi
+  _have="$(tf_cport "$ID_EP")"
+  if [ -n "$_have" ]; then
+    if [ "$_have" = "$ID_CPORT" ] || [ "$_have" = "$ID_OWNPORT" ]; then
+      say "Traefik: $TF_NS/$TF_NAME already has the \"$ID_EP\" entrypoint on :$_have; nothing to change"
+      return 0
+    fi
+    die 2 "Traefik $TF_NS/$TF_NAME already has an entrypoint named \"$ID_EP\" but on port $_have, not the $ID_CPORT that identity.host=$IDNAME:$ID_OWNPORT maps to. Use --set identity.host=$IDNAME:$_have, or rename the entrypoint the chart uses with --set traefik.entryPoints.identity=<name>."
+  fi
+  [ -z "$NO_TRAEFIK_CHANGES" ] || tf_manual "--no-traefik-changes was given"
+  if tf_is_k3s; then
+    tf_add_k3s || tf_manual "the HelmChartConfig kube-system/traefik already sets ports in a form this script does not merge"
+  elif tf_add_helm; then :
+  else
+    tf_manual "it was not installed by the official Traefik Helm chart (no meta.helm.sh annotations / chart label), so this script does not know how to change it"
+  fi
+}
+
+# ---------------------------------------------------------------- is sign-in possible?
+# probe_identity URL HOSTHEADER: the identity provider's discovery document answers 200 within PROBE_WAIT seconds.
+probe_identity() {
+  _pe=$(( $(date +%s) + PROBE_WAIT ))
+  while :; do
+    _sv="$POLL_HOST"; POLL_HOST="$2"; _c="$(http_code "$1/.well-known/openid-configuration")"; POLL_HOST="$_sv"
+    [ "$_c" = 200 ] && return 0
+    [ "$(date +%s)" -ge "$_pe" ] && return 1
+    sleep "$POLL"
+  done
+}
+
+# check_signin: the app being up is not enough, people sign in through the identity provider. (1) With its own port, Traefik must
+# have the entrypoint. (2) Its discovery document must answer through Traefik with the identity Host header. With TLS upstream
+# the public https URL is tried first: if it answers the proxy mapping is proven; if not, the mapping is a REQUIRED step the
+# installer cannot do (UPSTREAM_REQUIRED=1, printed at the end). Anything else that cannot work exits 4.
+check_signin() {
+  UPSTREAM_REQUIRED=""
+  [ "$IDENTITY_CHECK" = 1 ] || return 0
+  _pubport="${ID_OWNPORT:-$ID_PORT}"; _pubsfx=""; [ -z "$_pubport" ] || _pubsfx=":$_pubport"
+  if [ -n "$ID_OWNPORT" ] && tf_locate && [ -z "$(tf_cport "$ID_EP")" ]; then
+    die 4 "sign-in cannot work: identity.host is $IDNAME:$ID_OWNPORT but Traefik $TF_NS/$TF_NAME has no \"$ID_EP\" entrypoint, so nothing serves that port (browsers are redirected there to sign in). Add the entrypoint (re-run this installer without --no-traefik-changes, or see docs/install.md, One host name only)."
+  fi
+  if [ "$TLS_MODE" = upstream ]; then
+    _save="$PROBE_WAIT"; PROBE_WAIT=$((PROBE_WAIT / 3))
+    if probe_identity "https://$IDNAME$_pubsfx" ""; then
+      PROBE_WAIT="$_save"
+      say "Sign-in: https://$IDNAME$_pubsfx/ answers: the TLS proxy / tunnel reaches the identity provider"
+      return 0
+    fi
+    PROBE_WAIT="$_save"
+    UPSTREAM_REQUIRED=1
+  fi
+  if [ "$DISCOVERED" != 1 ] || [ "${POLL_OK:-0}" != 1 ]; then
+    say "Sign-in: the identity provider's discovery document was not probed (Traefik is not reachable from this machine; see above)."
+    return 0
+  fi
+  _base="$(printf '%s' "$POLL_URL" | sed 's#^\([a-z]*://[^:/]*\).*#\1#')"
+  if [ -n "$ID_OWNPORT" ]; then _base="$_base:$ID_OWNPORT"; else _base="$POLL_URL"; fi
+  if probe_identity "$_base" "$IDNAME"; then
+    say "Sign-in: the identity provider answers through Traefik at $_base (Host: $IDNAME)"
+    return 0
+  fi
+  if [ "$TLS_MODE" = upstream ] && [ -n "$ID_OWNPORT" ]; then
+    warn "the identity provider does not answer at $_base from this machine; with TLS upstream that port may only exist on the proxy side. Sign-in works only once the mapping below is in place."
+    return 0
+  fi
+  die 4 "sign-in cannot work: the identity provider's discovery document does not answer at $_base (Host: $IDNAME)${ID_OWNPORT:+. Traefik has the \"$ID_EP\" entrypoint, but port $ID_OWNPORT is not published/open on this address (hostPort, Service port, firewall)}. Browsers are sent to $IDNAME${ID_OWNPORT:+:$ID_OWNPORT} to sign in. Look at: kubectl -n $NS get pods -l app.kubernetes.io/name=zitadel; kubectl -n $NS get ingressroute"
+}
+
+# TLS in front of Traefik: the mapping the proxy / tunnel must provide, with the real addresses
+print_upstream_mapping() {
+  tf_locate >/dev/null 2>&1 || { TF_ARGS=""; TF_PORTS=""; TF_SVC=""; }
+  _pp="${ID_PORT:-443}"
+  tf_ep_target "$WEB_EP"; _wurl="$EP_URL"; _wnote="$EP_NOTE"
+  if [ -n "$UPSTREAM_REQUIRED" ]; then
+    printf '\n  REQUIRED, and only you can do it: sign-in works once your TLS proxy / tunnel maps the public https ports to Traefik\n  (already done? this machine could not reach the public address to check; a proxy on this same host often cannot be\n  reached from the host itself, so open the app in a browser to confirm).\n'
+  else
+    printf '\n  TLS proxy / tunnel mapping (checked from here, it works):\n'
+  fi
+  printf '  TLS ends in front of the cluster (tls.mode=upstream); Traefik speaks plain HTTP. Forward, keeping the Host header unchanged:\n'
+  _iurl=""
+  if [ -n "$ID_OWNPORT" ]; then
+    printf '      https://%s:%s   ->   %s\n          (%s)\n' "${FACT_HOST:-<routes.host>}" "$_pp" "${_wurl:-<Traefik web entrypoint>}" "$_wnote"
+    tf_ep_target "$ID_EP"; _iurl="$EP_URL"
+    printf '      https://%s:%s   ->   %s\n          (%s)\n' "$IDNAME" "$ID_OWNPORT" "${_iurl:-<Traefik identity entrypoint>}" "$EP_NOTE"
+  else
+    printf '      https://%s:%s  and  https://%s:%s   ->   %s\n          (%s)\n' "${FACT_HOST:-<routes.host>}" "$_pp" "$IDNAME" "$_pp" "${_wurl:-<Traefik web entrypoint>}" "$_wnote"
+  fi
+  if [ -n "$_wurl" ]; then
+    printf '      for example with Caddy:   %s:%s { reverse_proxy %s }\n' "${FACT_HOST:-<routes.host>}" "$_pp" "${_wurl#http://}"
+    if [ -n "$_iurl" ]; then printf '                                %s:%s { reverse_proxy %s }\n' "$IDNAME" "$ID_OWNPORT" "${_iurl#http://}"; fi
+  fi
+  if [ -n "$ID_OWNPORT" ] && [ -n "$UPSTREAM_REQUIRED" ]; then
+    printf '      (a proxy on this same host cannot listen on a port that Traefik already holds as a hostPort: use another host or a tunnel for it.)\n'
   fi
 }
 
@@ -668,7 +1030,7 @@ poll_ready() {
 discover_url() {
   # BASE_URL: where the app is opened (names); POLL_URL + POLL_HOST: where this machine reaches it for the readiness check
   # (an address, with the public host as the Host header, so no DNS is needed).
-  BASE_URL=""; DISCOVERED=0; POLL_URL=""; POLL_HOST="${PUBLIC_HOST:-}"
+  BASE_URL=""; DISCOVERED=0; POLL_URL=""; POLL_HOST="${PUBLIC_HOST:-}"; POLL_OK=0
   TRAEFIK_NS="$NS"; TRAEFIK_SVC="$REL-traefik"
   if [ -n "$URL_OVERRIDE" ]; then
     POLL_URL="${URL_OVERRIDE%/}"; BASE_URL="$POLL_URL"; DISCOVERED=1
@@ -676,6 +1038,11 @@ discover_url() {
       case "$POLL_URL" in https://*) _os=https ;; *) _os=http ;; esac
       [ "$(release_value tls mode)" != upstream ] || _os=https
       BASE_URL="$_os://$PUBLIC_HOST${ID_PORT:+:$ID_PORT}"
+    fi
+    # TLS ends in front of Traefik: the given https URL leads to the proxy, which this machine may not reach (it may be
+    # the proxy's own host); probe Traefik's own plain-HTTP entrypoint on the node instead, with the public Host header.
+    if { [ "${TLS_MODE:-}" = upstream ] || [ "$(release_value tls mode)" = upstream ]; } && tf_locate; then
+      tf_ep_target "$WEB_EP"; [ -z "$EP_URL" ] || POLL_URL="$EP_URL"
     fi
     return 0
   fi
@@ -705,10 +1072,12 @@ EOF
   _pt="${ID_PORT:-$(release_value routes port)}"
   BASE_URL="$_scheme://$_addr${_pt:+:$_pt}"
   POLL_URL="$BASE_URL"
-  if [ "$(release_value tls mode)" = upstream ]; then
+  if [ "${TLS_MODE:-}" = upstream ] || [ "$(release_value tls mode)" = upstream ]; then
     # TLS ends in front of Traefik: people use https://host[:port], but from here the only thing to probe is Traefik's own
     # plain-HTTP entrypoint (no certificate, and the public port is the proxy's, not Traefik's).
     BASE_URL="https://${_host:-$_addr}${_pt:+:$_pt}"; POLL_URL="http://${_ip:-${_hn:-$_addr}}"
+    # no load-balancer address (microk8s): the public name leads to the proxy, not to Traefik; use Traefik's own node address
+    if [ -z "${_ip:-$_hn}" ] && tf_locate; then tf_ep_target "$WEB_EP"; [ -z "$EP_URL" ] || POLL_URL="$EP_URL"; fi
     [ -z "$_host" ] || POLL_HOST="$_host"
     DISCOVERED=1
     return 0
@@ -752,7 +1121,7 @@ wait_app() {
   discover_url
   if [ "$DISCOVERED" = 1 ]; then
     _b1="$TIMEOUT_S"; [ "$_b1" -le 60 ] || _b1=60
-    if poll_ready "$POLL_URL" "$_b1"; then return 0; fi
+    if poll_ready "$POLL_URL" "$_b1"; then POLL_OK=1; return 0; fi
     [ "$TIMEOUT_S" -gt "$_b1" ] || die 4 "the app did not answer $POLL_URL/readyz within $TIMEOUT"
     warn "$POLL_URL/readyz does not answer from this machine yet; checking the app through a port-forward instead"
   fi
@@ -807,6 +1176,7 @@ report_indexes() {
 final_message() {
   if [ "$DISCOVERED" = 1 ]; then _url="$BASE_URL"; else _url="http://localhost:8080"; fi
   _ready="Astro Pixel Platform is ready."
+  [ -z "${UPSTREAM_REQUIRED:-}" ] || _ready="Astro Pixel Platform is installed. The public https address could not be reached from this machine, so the TLS proxy / tunnel mapping below is unverified: sign-in works once it is in place (REQUIRED)."
   [ "${APSD_ZERO:-0}" != 1 ] || _ready="Astro Pixel Platform is installed, with apsd scaled to 0 (it does not serve yet: re-run without apsd.replicaCount=0)."
   cat <<MSG
 
@@ -820,6 +1190,7 @@ MSG
               for a local try: kubectl -n $TRAEFIK_NS port-forward svc/$TRAEFIK_SVC 8080:80 with routes.port=8080)
 MSG
   fi
+  if [ "${TLS_MODE:-}" = upstream ] && [ "${IDENTITY_CHECK:-}" = 1 ]; then print_upstream_mapping; fi
   cat <<MSG
 
   First user: open it and create your account (the first account becomes the owner, a platform administrator).
@@ -855,6 +1226,7 @@ post_install() {
   mark_crds
   wait_identity
   wait_app
+  check_signin
   report_indexes
   final_message
 }
@@ -870,6 +1242,8 @@ main() {
   ensure_helm
   check_release_state
   resolve_identity
+  identity_facts
+  ensure_identity_entrypoint
   fetch_chart
   run_helm
   [ -z "$DRY_RUN" ] || { say "dry run: nothing was installed"; exit 0; }
