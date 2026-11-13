@@ -7,7 +7,7 @@ object store, the API and web UI, the plate-solving verbs and the per-node astro
 curl -sfL https://raw.githubusercontent.com/parsecpipeline/aps-install/main/install.sh | sh -
 ```
 
-This copy installs release **0.2.0**. You need `kubectl` pointed at the cluster (a cluster-admin context: the install
+This copy installs release **0.3.0**. You need `kubectl` pointed at the cluster (a cluster-admin context: the install
 creates CRDs and ClusterRoles) and a default StorageClass. Helm is downloaded (checksum-pinned) into a temporary directory
 when you do not have it.
 
@@ -24,7 +24,7 @@ Pass options after `-s --`:
 
 ```sh
 curl -sfL https://raw.githubusercontent.com/parsecpipeline/aps-install/main/install.sh | sh -s -- \
-  --namespace aps --set ingress.host=aps.example.org --values my-values.yaml
+  --namespace aps --set routes.host=aps.example.org --values my-values.yaml
 sh install.sh --help          # every flag
 ```
 

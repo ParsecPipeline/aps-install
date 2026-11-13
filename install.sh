@@ -2,7 +2,7 @@
 # Astro Pixel Platform installer / upgrader: a thin, safe wrapper around the `aps` Helm chart.
 #
 #   curl -sfL https://raw.githubusercontent.com/parsecpipeline/aps-install/main/install.sh | sh -
-#   curl -sfL <url>/install.sh | sh -s -- --values my-values.yaml --set ingress.host=aps.example.org
+#   curl -sfL <url>/install.sh | sh -s -- --values my-values.yaml --set routes.host=aps.example.org
 #
 # Re-running it is the upgrade: `helm upgrade --install` keeps the generated Secret, the Postgres/object-store
 # volumes and the node-local astrometry indexes. POSIX sh. Never uses sudo, never edits your kubeconfig, never
@@ -17,7 +17,7 @@
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.2.0" # @version
+DEFAULT_VERSION="0.3.0" # @version
 
 # --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
 # TAG, live here on purpose (a checksum fetched from the host that serves the script proves nothing). The script is
@@ -43,7 +43,7 @@ Usage: install.sh [flags]
   --timeout DUR          helm --wait / readiness budget (default 15m; env APS_TIMEOUT)
   --wait-indexes[=DUR]   also wait (default 30m) for every eligible node to hold the astrometry indexes;
                          without it the install only reports index progress and never blocks on it
-  --url URL              the address users will open, overriding Ingress discovery (env APS_URL)
+  --url URL              the address users will open, overriding Traefik discovery (env APS_URL)
   --plain-http           the OCI chart registry speaks plain HTTP (a local/lab registry; env APS_PLAIN_HTTP=1)
   --bootstrap            bare Linux host with no reachable Kubernetes: first install single-node k3s (pinned version,
                          checksum-verified installer, its bundled Traefik is the ingress), wait for the node, use
@@ -53,9 +53,20 @@ Usage: install.sh [flags]
                          APS_K3S_INSTALL_SHA256 = sha256 of that tag's install.sh; env APS_K3S_VERSION)
   --yes, -y              do not ask for confirmation (env APS_ASSUME_YES=1)
   --dry-run              pass --dry-run to helm (nothing is installed)
+  --no-identity-values   do not generate the identity host values (routes.host, identity.host, the Zitadel external domain and the
+                         Argo SSO settings): you pass them yourself (deploy/helm/identity-values.sh writes them; see docs/install.md)
   --adopt-argo-crds      proceed although Argo Workflows CRDs already exist on the cluster (they will be
                          overwritten with this chart's Argo version)
   --help, -h             this text
+
+Names: the app needs a public host name (the identity provider redirects browsers back to it) and the bundled identity
+provider its own, next to it (id.<host>). Give one with --set routes.host=aps.example.org (and --set routes.port=8080 /
+tls.mode=... when they apply); without one this script uses aps.<node address>.sslip.io (public wildcard DNS) when it can find
+the address. Upgrades keep the host the release already has.
+
+Traefik: the app is published through Traefik (IngressRoutes). Before installing, this script looks for a running Traefik
+(its CRDs plus a controller): found -> it is reused (traefik.install=false), none -> the chart installs one (true). The
+decision is printed. Force it with --set traefik.install=true|false.
 
 Exit codes: 0 ok, 2 preflight or usage, 3 helm failed, 4 timed out waiting for the app.
 USAGE
@@ -107,6 +118,7 @@ ASSUME_YES="${APS_ASSUME_YES:-}"
 WAIT_INDEXES=0
 DRY_RUN=""
 ADOPT_CRDS=""
+NO_IDENTITY_VALUES=""
 PLAIN_HTTP="${APS_PLAIN_HTTP:-}"
 BOOTSTRAP="${APS_BOOTSTRAP:-}"
 K3S_VERSION="${APS_K3S_VERSION:-}"
@@ -140,6 +152,7 @@ parse_args() {
       --wait-indexes=*) WAIT_INDEXES="$(dur_secs "${1#*=}")" || die 2 "bad --wait-indexes duration: ${1#*=}"; shift ;;
       --yes|-y) ASSUME_YES=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
+      --no-identity-values) NO_IDENTITY_VALUES=1; shift ;;
       --adopt-argo-crds) ADOPT_CRDS=1; shift ;;
       --plain-http) PLAIN_HTTP=1; shift ;;
       --bootstrap) BOOTSTRAP=1; shift ;;
@@ -238,8 +251,8 @@ poll_until() {
   done
 }
 have_nodes() { [ -n "$(kc get nodes -o name 2>/dev/null)" ]; }
-have_ingressclass() { [ -n "$(kc get ingressclass -o name 2>/dev/null)" ]; }
 have_traefik() { [ -n "$(kc -n kube-system get deploy traefik -o name 2>/dev/null)" ]; }
+have_traefik_crd() { kc get crd ingressroutes.traefik.io -o name >/dev/null 2>&1; }
 have_default_sc() { case "$(kc get storageclass -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null)" in *"|true"*) return 0 ;; *) return 1 ;; esac; }
 
 # Something already listening on 80/443 would leave k3s's bundled Traefik (host ports 80/443) Pending.
@@ -308,11 +321,11 @@ bootstrap() {
     kc -n kube-system rollout status deploy/traefik --timeout="${BOOT_WAIT}s" >/dev/null 2>&1 \
       || warn "k3s's Traefik ingress is not ready yet; the UI may take a minute longer to answer"
   fi
-  poll_until "$BOOT_WAIT" have_ingressclass || warn "k3s has no IngressClass yet"
+  poll_until "$BOOT_WAIT" have_traefik_crd || warn "k3s has not registered Traefik's CRDs yet"
   say "k3s is ready (kubeconfig $K3S_KUBECONFIG)"
 }
 
-# The host's primary address, for the final URL when the Ingress carries none (bootstrap only).
+# The host's primary address, for the final URL when no Traefik address was found (bootstrap only).
 host_ip() {
   _hip="${APS_HOST_IP:-}"   # explicit override (also the test seam)
   if [ -z "$_hip" ] && command -v hostname >/dev/null 2>&1; then _hip="$(hostname -I 2>/dev/null </dev/null | awk '{print $1}')"; fi
@@ -350,8 +363,8 @@ preflight() {
   _ver="$(kc get --raw /version 2>/dev/null)"
   _minor="$(printf '%s' "$_ver" | sed -n 's/.*"minor": *"\([0-9]*\).*/\1/p' | head -n 1)"
   _major="$(printf '%s' "$_ver" | sed -n 's/.*"major": *"\([0-9]*\).*/\1/p' | head -n 1)"
-  if [ -n "$_minor" ] && [ "${_major:-1}" = 1 ] && [ "$_minor" -lt 27 ]; then
-    die 2 "Kubernetes 1.$_minor is too old: this chart needs 1.27 or newer"
+  if [ -n "$_minor" ] && [ "${_major:-1}" = 1 ] && [ "$_minor" -lt 30 ]; then
+    die 2 "Kubernetes 1.$_minor is too old: this chart needs 1.30 or newer (the bundled Zitadel, native sidecars)"
   fi
 
   # Permissions: cluster-scoped objects are installed (CRDs, ClusterRoles); a namespace only when it does not exist.
@@ -379,11 +392,6 @@ preflight() {
     esac ;;
   esac
 
-  # Ingress: optional.
-  if [ -z "$(kc get ingressclass -o name 2>/dev/null)" ]; then
-    warn "no IngressClass found (no ingress controller installed). The install works; reach the UI with a port-forward (printed at the end), or install an ingress controller (for example ingress-nginx) and re-run."
-  fi
-
   # Architectures: images are published for linux/amd64.
   _arch="$(kc get nodes -o 'jsonpath={.items[*].status.nodeInfo.architecture}' 2>/dev/null)"
   for _a in $_arch; do
@@ -398,6 +406,169 @@ preflight() {
       die 2 "Argo Workflows CRDs (workflows.argoproj.io) already exist and were not installed by release \"$REL\" in namespace \"$NS\". Installing would overwrite them with this chart's Argo version and may break another Argo on this cluster. Re-run with --adopt-argo-crds if that is what you want."
     fi
   fi
+}
+
+# ---------------------------------------------------------------- Traefik
+# The app is published through Traefik IngressRoutes. A Traefik that is already running (CRDs + a controller) is reused;
+# otherwise the chart installs one. Helm cannot make that decision (a subchart condition cannot `lookup`), so it is made
+# here and handed to the chart as a generated values file that comes BEFORE the user's -f files (their values win), unless
+# the user passed --set traefik.install=... (which wins over everything).
+traefik_controllers() { # "namespace/name" of every Traefik Deployment/DaemonSet on the cluster
+  kc get deploy,ds -A -l app.kubernetes.io/name=traefik -o 'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null
+}
+
+resolve_traefik() {
+  TRAEFIK_VALUES=""
+  case "$HELM_USER" in
+    *traefik.install=*) say "Traefik: traefik.install was given on the command line; using it as is"; return 0 ;;
+  esac
+  _ctl="$(traefik_controllers)"
+  _first="$(printf '%s\n' "$_ctl" | head -n 1)"
+  if printf '%s\n' "$_ctl" | grep -qxF "$NS/$REL-traefik"; then
+    _ti=true
+    say "Traefik: $NS/$REL-traefik belongs to this release; keeping it (traefik.install=true)"
+  elif [ -n "$_first" ] && have_traefik_crd; then
+    _ti=false
+    say "Traefik: found $_first with its CRDs; reusing it (traefik.install=false), nothing will be installed"
+  elif [ -n "$_first" ]; then
+    _ti=true
+    warn "Traefik runs here ($_first) but its CRDs (ingressroutes.traefik.io) are missing (is the kubernetesCRD provider disabled?). Installing the chart's own Traefik, which brings the CRDs; set --set traefik.install=false to use yours once the CRDs exist."
+  else
+    _ti=true
+    if have_traefik_crd; then say "Traefik: its CRDs exist but no controller is running; the chart installs one (traefik.install=true)"
+    else say "Traefik: none found; the chart installs Traefik (traefik.install=true)"; fi
+  fi
+  mk_tmp
+  TRAEFIK_VALUES="$TMP/traefik-install.yaml"
+  printf 'traefik:\n  install: %s\n' "$_ti" > "$TRAEFIK_VALUES"
+}
+
+# ---------------------------------------------------------------- identity values
+# The Zitadel and Argo subcharts take the identity host, the issuer and the Argo redirect URL as plain values that a
+# parent chart cannot template, so they repeat routes.host. This function writes them from ONE host (templates/validate.yaml
+# fails the render when they disagree). deploy/helm/identity-values.sh runs this same function for Helm users.
+# BEGIN identity-values
+# aps_identity_values HOST ID_HOST PORT TLS ARGO TARGET RELEASE -> values YAML on stdout.
+#   ID_HOST: "" = id.HOST; NAME:PORT serves the identity provider on another port (of HOST itself, or another name). PORT: public port when not 80/443 ("" = default). TLS: 1 = https at Traefik, upstream = https in front of Traefik (Traefik sees plain HTTP), 0 = http. ARGO: path | host=NAME | off.
+#   TARGET: with TLS, where the Argo pod's identity forwarder connects so the public certificate answers (default RELEASE-traefik:443).
+aps_identity_values() {
+  _iv_host="$1"; _iv_idhost="${2:-id.$1}"; _iv_port="$3"; _iv_tls="${4:-0}"; _iv_argo="${5:-path}"; _iv_target="$6"; _iv_rel="${7:-aps}"
+  _iv_scheme=http; _iv_def=80; _iv_secure=false
+  if [ "$_iv_tls" = 1 ] || [ "$_iv_tls" = upstream ]; then _iv_scheme=https; _iv_def=443; _iv_secure=true; fi
+  _iv_pub="${_iv_port:-$_iv_def}"
+  _iv_suffix=""; [ -z "$_iv_port" ] || _iv_suffix=":$_iv_port"
+  # the identity provider's own port (NAME:PORT) replaces the app's for it
+  _iv_idsuffix="$_iv_suffix"; _iv_idpub="$_iv_pub"; _iv_idname="$_iv_idhost"; _iv_own=""
+  case "$_iv_idhost" in *:*) _iv_own="${_iv_idhost##*:}"; _iv_idname="${_iv_idhost%:*}"; _iv_idsuffix=":$_iv_own"; _iv_idpub="$_iv_own" ;; esac
+  [ -n "$_iv_target" ] || _iv_target="$_iv_rel-traefik:443"
+  printf '# generated by aps_identity_values for %s\n' "$_iv_host"
+  printf 'routes:\n  host: "%s"\n' "$_iv_host"
+  [ -z "$_iv_port" ] || printf '  port: "%s"\n' "$_iv_port"
+  printf 'identity:\n  host: "%s"\n' "$_iv_idhost"
+  printf 'idp:\n  zitadel:\n    configmapConfig:\n      ExternalDomain: "%s"\n      ExternalPort: %s\n      ExternalSecure: %s\n' "$_iv_idname" "$_iv_idpub" "$_iv_secure"
+  if [ -n "$_iv_own" ]; then
+    # the Traefik this chart installs gets an entrypoint on that port (a reused Traefik needs one added: docs/install.md)
+    _iv_cport="$_iv_own"; [ "$_iv_own" -ge 1024 ] || _iv_cport=$((10000 + _iv_own))
+    printf 'traefikController:\n  ports:\n    identity:\n      port: %s\n      exposedPort: %s\n      protocol: TCP\n      expose: {default: true}\n' "$_iv_cport" "$_iv_own"
+  fi
+  [ "$_iv_argo" != off ] || return 0
+  case "$_iv_argo" in
+    path)
+      _iv_abase="$_iv_scheme://$_iv_host$_iv_suffix/argo"; _iv_bh="/argo/"
+      printf 'argoUI:\n  enabled: true\n  path: /argo/\n' ;;
+    host=*)
+      _iv_ah="${_iv_argo#host=}"; _iv_abase="$_iv_scheme://$_iv_ah$_iv_suffix"; _iv_bh="/"
+      printf 'argoUI:\n  enabled: true\n  host: "%s"\n' "$_iv_ah" ;;
+    *) echo "aps_identity_values: ARGO must be path, host=NAME or off" >&2; return 2 ;;
+  esac
+  # The forwarder listens on the public port of the identity host (127.0.0.1 inside the Argo pod) and forwards to the Zitadel
+  # Service, or with TLS to Traefik so that the public certificate answers. A port below 1024 needs the unprivileged-port sysctl.
+  # With TLS upstream the cluster holds no certificate: the forwarder terminates TLS itself (self-signed, loopback only) and
+  # Argo skips verifying it; the hop to Zitadel is plain HTTP.
+  _iv_ftls=""; _iv_skip=""
+  if [ "$_iv_tls" = 1 ]; then _iv_fwd="$_iv_target"; else _iv_fwd="$_iv_rel-zitadel:8080"; fi
+  if [ "$_iv_tls" = upstream ]; then _iv_ftls='"--tls", '; _iv_skip="      insecureSkipVerify: true\n"; fi
+  printf 'argo-workflows:\n  server:\n    baseHref: %s\n    authModes: [sso, client]\n' "$_iv_bh"
+  printf '    sso:\n      enabled: true\n      issuer: "%s://%s%s"\n      redirectUrl: "%s/oauth2/callback"\n%b' "$_iv_scheme" "$_iv_idname" "$_iv_idsuffix" "$_iv_abase" "$_iv_skip"
+  printf '    # The identity host names Zitadel; inside this pod it must reach it whatever DNS says: map it to localhost and run a\n'
+  printf '    # TCP forwarder sidecar (a native sidecar: an init container that keeps running) from the apsd image, which renders\n'
+  printf '    # through tpl from global values.\n'
+  printf '    hostAliases:\n      - ip: 127.0.0.1\n        hostnames: ["%s"]\n' "$_iv_idname"
+  if [ "$_iv_idpub" -lt 1024 ]; then
+    printf '    podSecurityContext:\n      sysctls:\n        - {name: net.ipv4.ip_unprivileged_port_start, value: "0"}\n'
+  fi
+  printf '    extraInitContainers:\n      - name: identity-forward\n'
+  printf "        image: '{{ include \"aps.globalApsdImage\" . }}'\n"
+  printf "        imagePullPolicy: '{{ .Values.global.imagePullPolicy }}'\n"
+  printf '        restartPolicy: Always\n        command: ["/app/apsd", "forward", %s":%s", "%s"]\n' "$_iv_ftls" "$_iv_idpub" "$_iv_fwd"
+  printf '        securityContext: {runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}\n'
+}
+# END identity-values
+
+# ---------------------------------------------------------------- identity host
+# set_value KEY: the value of `--set KEY=...` the user passed ("" if none; the last one wins).
+set_value() {
+  printf '%s' "$HELM_USER" | tr ' ' '\n' | sed -n "s/^'$1=\(.*\)'\$/\1/p" | tail -n 1
+}
+
+# release_value TOP KEY: TOP.KEY from the installed release's user-supplied values ("" if none).
+release_value() {
+  hm get values "$REL" -n "$NS" -o yaml 2>/dev/null | awk -v top="$1" -v key="$2" '
+    /^[^ #]/ { in_top = ($0 == top ":"); next }
+    in_top && $1 == key ":" { sub(/^[^:]*: */, ""); gsub(/^"|"$/, ""); print; exit }'
+}
+
+# default_host: aps.<address>.sslip.io from the address this cluster is reached at, or fail (empty output).
+default_host() {
+  _dip=""
+  [ -z "$BOOTSTRAPPED" ] || _dip="$(host_ip)"
+  [ -n "$_dip" ] || _dip="$(kc get svc -A -l app.kubernetes.io/name=traefik -o 'jsonpath={range .items[*]}{.status.loadBalancer.ingress[0].ip}{"\n"}{end}' 2>/dev/null | grep . | head -n 1)"
+  if [ -z "$_dip" ]; then
+    _ips="$(kc get nodes -o 'jsonpath={range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null | grep .)"
+    [ "$(printf '%s\n' "$_ips" | grep -c .)" = 1 ] && _dip="$_ips"
+  fi
+  [ -z "$_dip" ] || printf 'aps.%s.sslip.io' "$_dip"
+}
+
+# The identity host values (see aps_identity_values): generated into a file placed before the user's -f, so what the user sets wins.
+resolve_identity() {
+  ID_VALUES=""; ID_PORT=""; PUBLIC_HOST=""
+  if [ -n "$NO_IDENTITY_VALUES" ]; then say "Identity: --no-identity-values; the identity host values are yours"; return 0; fi
+  case "$HELM_USER" in *ExternalDomain=*|*identity.mode=external*) say "Identity: given on the command line; using it as is"; return 0 ;; esac
+  _h="$(set_value routes.host)"; _p="$(set_value routes.port)"; _tm="$(set_value tls.mode)"
+  if [ -z "$_h" ] && [ -n "$URL_OVERRIDE" ]; then
+    # --url http://host[:port] says it all; an IP address cannot carry the identity provider's own name, so it becomes
+    # aps.<ip>.sslip.io (the URL is still where this machine reaches the cluster)
+    _u="${URL_OVERRIDE#*://}"; _u="${_u%%/*}"
+    _h="${_u%%:*}"; case "$_u" in *:*) _p="${_u##*:}" ;; esac
+    case "$URL_OVERRIDE" in https://*) [ -n "$_tm" ] || _tm=secret ;; esac
+    case "$_h" in *[!0-9.]*|"") ;; *.*.*.*) _h="aps.$_h.sslip.io" ;; esac
+  fi
+  if [ -z "$_h" ] && [ -n "$(release_value identity host)" ]; then
+    ID_PORT="$(release_value routes port)"
+    PUBLIC_HOST="$(release_value routes host)"
+    say "Identity: keeping the host of release \"$REL\" ($(release_value routes host))"
+    return 0
+  fi
+  if [ -z "$_h" ]; then
+    _h="$(default_host)"
+    [ -n "$_h" ] || die 2 "cannot tell which host name to serve the app and its identity provider on. Pass --set routes.host=aps.example.org (a name that resolves to this cluster's Traefik for your browser) and, when it is not on port 80/443, --set routes.port=8080. See docs/install.md (Names)."
+    say "Identity: no routes.host given; using $_h (public wildcard DNS for this node's address). The identity provider will be id.$_h. Use --set routes.host=... for your own name."
+  fi
+  PUBLIC_HOST="$_h"
+  _tls=0; case "$_tm" in ""|none) ;; upstream) _tls=upstream ;; *) _tls=1 ;; esac
+  _argo=path
+  case "$HELM_USER" in *argoUI.enabled=false*) _argo=off ;; esac
+  _ah="$(set_value argoUI.host)"; [ -z "$_ah" ] || _argo="host=$_ah"
+  _target=""
+  if [ "$_tls" = 1 ] && [ "${_ti:-$(set_value traefik.install)}" != true ]; then
+    _ts="$(kc get svc -A -l app.kubernetes.io/name=traefik -o 'jsonpath={range .items[*]}{.metadata.name}.{.metadata.namespace}.svc{"\n"}{end}' 2>/dev/null | head -n 1)"
+    [ -z "$_ts" ] || _target="$_ts:443"
+  fi
+  mk_tmp
+  ID_VALUES="$TMP/identity-hosts.yaml"
+  ID_PORT="$_p"
+  aps_identity_values "$_h" "$(set_value identity.host)" "$_p" "$_tls" "$_argo" "$_target" "$REL" > "$ID_VALUES" || die 2 "could not generate the identity values"
 }
 
 # An interrupted release (pending-install/upgrade/rollback) cannot be upgraded; never auto-delete release Secrets.
@@ -418,7 +589,7 @@ fetch_chart() {
   if [ -n "$CHART" ]; then
     [ -e "$CHART" ] || die 2 "--chart $CHART does not exist"
     CHART_REF="$CHART"
-    if [ -d "$CHART" ] && ! ls "$CHART"/charts/argo-workflows-*.tgz >/dev/null 2>&1; then
+    if [ -d "$CHART" ] && ! { ls "$CHART"/charts/argo-workflows-*.tgz && ls "$CHART"/charts/traefik-*.tgz && ls "$CHART"/charts/zitadel-*.tgz; } >/dev/null 2>&1; then
       say "building chart dependencies"
       hm dependency build "$CHART" >&2 || die 2 "helm dependency build failed"
     fi
@@ -444,10 +615,17 @@ fetch_chart() {
 # ---------------------------------------------------------------- install
 run_helm() {
   set -- upgrade --install "$REL" "$CHART_REF" -n "$NS" --create-namespace --wait --timeout "$TIMEOUT" --reset-then-reuse-values
+  if [ -n "$TRAEFIK_VALUES" ]; then set -- "$@" -f "$TRAEFIK_VALUES"; fi
+  if [ -n "$ID_VALUES" ]; then set -- "$@" -f "$ID_VALUES"; fi
   if [ -n "$CHART_VERSIONED" ] && [ -n "$VERSION" ]; then set -- "$@" --version "$VERSION"; fi
   eval "set -- \"\$@\" $HELM_USER"
   [ -z "$DRY_RUN" ] || set -- "$@" --dry-run
   if [ -n "$PLAIN_HTTP" ] && [ -n "$CHART_VERSIONED" ]; then set -- "$@" --plain-http; fi
+  # Zitadel's init/setup Jobs are ordinary Jobs whose pod template is immutable: remove the finished ones so an upgrade
+  # recreates them (migrations re-run) instead of failing on the patch.
+  if [ -z "$DRY_RUN" ] && hm status "$REL" -n "$NS" >/dev/null 2>&1; then
+    kc -n "$NS" delete job "$REL-zitadel-init" "$REL-zitadel-setup" --ignore-not-found >/dev/null 2>&1 || true
+  fi
   say "Installing release \"$REL\" into namespace \"$NS\" (pulls images and waits for the pods; a first install takes a few minutes)"
   if ! hm "$@"; then
     warn "helm failed. Release status and recent warning events follow; re-running this installer resumes where it stopped."
@@ -466,9 +644,10 @@ mark_crds() {
 
 http_code() { # http_code URL -> 3-digit code (000 on failure)
   if command -v curl >/dev/null 2>&1; then
-    curl -s -o /dev/null -m 5 -w '%{http_code}' "$1" </dev/null 2>/dev/null || printf '000'
+    # POLL_HOST: the public host name goes in the Host header, so the address can be used without DNS
+    curl -s -o /dev/null -m 5 ${POLL_HOST:+-H "Host: $POLL_HOST"} -w '%{http_code}' "$1" </dev/null 2>/dev/null || printf '000'
   elif command -v wget >/dev/null 2>&1; then
-    if wget -q -T 5 -O /dev/null "$1" </dev/null 2>/dev/null; then printf '200'; else printf '000'; fi
+    if wget -q -T 5 -O /dev/null ${POLL_HOST:+--header="Host: $POLL_HOST"} "$1" </dev/null 2>/dev/null; then printf '200'; else printf '000'; fi
   else
     printf '000'
   fi
@@ -484,30 +663,66 @@ poll_ready() {
   done
 }
 
-# Sets BASE_URL and DISCOVERED (1 = a usable address was found or given).
+# Sets BASE_URL and DISCOVERED (1 = a usable address was found or given), and TRAEFIK_NS / TRAEFIK_SVC (the Traefik Service
+# that serves this release; used for the port-forward hint).
 discover_url() {
-  BASE_URL=""; DISCOVERED=0
-  if [ -n "$URL_OVERRIDE" ]; then BASE_URL="${URL_OVERRIDE%/}"; DISCOVERED=1; return 0; fi
-  _i="$(kc -n "$NS" get ingress "$REL" -o 'jsonpath={.status.loadBalancer.ingress[0].ip}|{.status.loadBalancer.ingress[0].hostname}|{.spec.rules[0].host}|{.spec.tls}' 2>/dev/null)" || _i=""
-  _ip=""; _hn=""; _host=""; _tls=""
-  IFS='|' read -r _ip _hn _host _tls <<EOF
-$_i
+  # BASE_URL: where the app is opened (names); POLL_URL + POLL_HOST: where this machine reaches it for the readiness check
+  # (an address, with the public host as the Host header, so no DNS is needed).
+  BASE_URL=""; DISCOVERED=0; POLL_URL=""; POLL_HOST="${PUBLIC_HOST:-}"
+  TRAEFIK_NS="$NS"; TRAEFIK_SVC="$REL-traefik"
+  if [ -n "$URL_OVERRIDE" ]; then
+    POLL_URL="${URL_OVERRIDE%/}"; BASE_URL="$POLL_URL"; DISCOVERED=1
+    if [ -n "$PUBLIC_HOST" ]; then
+      case "$POLL_URL" in https://*) _os=https ;; *) _os=http ;; esac
+      [ "$(release_value tls mode)" != upstream ] || _os=https
+      BASE_URL="$_os://$PUBLIC_HOST${ID_PORT:+:$ID_PORT}"
+    fi
+    return 0
+  fi
+  # The public host and TLS come from the release's IngressRoute (routes.host / tls.mode).
+  _r="$(kc -n "$NS" get ingressroute "$REL" -o 'jsonpath={.spec.tls.secretName}|{.spec.routes[0].match}' 2>/dev/null)" || _r=""
+  _match=""; _tls=""
+  IFS='|' read -r _tls _match <<EOF   # the match is last: it contains | itself
+$_r
+EOF
+  _host="$(printf '%s' "$_match" | sed -n 's/.*Host(`\([^`]*\)`).*/\1/p')"
+  # The Traefik Service(s) (ours or the cluster's): the first one with a load-balancer address wins.
+  _svcs="$(kc get svc -A -l app.kubernetes.io/name=traefik -o 'jsonpath={range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.loadBalancer.ingress[0].ip}|{.status.loadBalancer.ingress[0].hostname}{"\n"}{end}' 2>/dev/null)" || _svcs=""
+  _ip=""; _hn=""; _first=1
+  while IFS='|' read -r _sn _sv _sip _shn; do
+    [ -n "$_sv" ] || continue
+    if [ "$_first" = 1 ]; then TRAEFIK_NS="$_sn"; TRAEFIK_SVC="$_sv"; _first=0; fi
+    if [ -n "$_sip$_shn" ]; then TRAEFIK_NS="$_sn"; TRAEFIK_SVC="$_sv"; _ip="$_sip"; _hn="$_shn"; break; fi
+  done <<EOF
+$_svcs
 EOF
   _addr="${_host:-${_ip:-$_hn}}"
   # k3s's Traefik answers on every node address through its host ports 80/443.
   [ -n "$_addr" ] || { [ -z "$BOOTSTRAPPED" ] || _addr="$(host_ip)"; }
   [ -n "$_addr" ] || return 0
   _scheme=http
-  case "$_tls" in ""|"[]") ;; *) _scheme=https ;; esac
-  BASE_URL="$_scheme://$_addr"
+  [ -z "$_tls" ] || _scheme=https
+  _pt="${ID_PORT:-$(release_value routes port)}"
+  BASE_URL="$_scheme://$_addr${_pt:+:$_pt}"
+  POLL_URL="$BASE_URL"
+  if [ "$(release_value tls mode)" = upstream ]; then
+    # TLS ends in front of Traefik: people use https://host[:port], but from here the only thing to probe is Traefik's own
+    # plain-HTTP entrypoint (no certificate, and the public port is the proxy's, not Traefik's).
+    BASE_URL="https://${_host:-$_addr}${_pt:+:$_pt}"; POLL_URL="http://${_ip:-${_hn:-$_addr}}"
+    [ -z "$_host" ] || POLL_HOST="$_host"
+    DISCOVERED=1
+    return 0
+  fi
+  # reach the cluster by its load-balancer address when there is one, naming the host in the Host header
+  if [ -n "$_host" ] && [ -n "${_ip:-$_hn}" ]; then POLL_URL="$_scheme://${_ip:-$_hn}${_pt:+:$_pt}"; POLL_HOST="$_host"; fi
   DISCOVERED=1
 }
 
-# Temporary port-forward to the web Service; sets PF_URL.
+# Temporary port-forward to apsd (it answers /readyz itself); sets PF_URL.
 start_portforward() {
   PF_URL=""
   mk_tmp
-  kubectl ${CTX:+--context "$CTX"} -n "$NS" port-forward "svc/$REL-web" :80 </dev/null >"$TMP/pf.out" 2>&1 &
+  kubectl ${CTX:+--context "$CTX"} -n "$NS" port-forward "svc/$REL-apsd" :80 </dev/null >"$TMP/pf.out" 2>&1 &
   PF_PID=$!
   _n=0
   while [ "$_n" -lt 30 ]; do
@@ -537,14 +752,14 @@ wait_app() {
   discover_url
   if [ "$DISCOVERED" = 1 ]; then
     _b1="$TIMEOUT_S"; [ "$_b1" -le 60 ] || _b1=60
-    if poll_ready "$BASE_URL" "$_b1"; then return 0; fi
-    [ "$TIMEOUT_S" -gt "$_b1" ] || die 4 "the app did not answer $BASE_URL/readyz within $TIMEOUT"
-    warn "$BASE_URL/readyz does not answer from this machine yet; checking the app through a port-forward instead"
+    if poll_ready "$POLL_URL" "$_b1"; then return 0; fi
+    [ "$TIMEOUT_S" -gt "$_b1" ] || die 4 "the app did not answer $POLL_URL/readyz within $TIMEOUT"
+    warn "$POLL_URL/readyz does not answer from this machine yet; checking the app through a port-forward instead"
   fi
-  start_portforward || die 4 "could not open a port-forward to svc/$REL-web"
+  start_portforward || die 4 "could not open a port-forward to svc/$REL-apsd"
   _rest=$((TIMEOUT_S - 1)); [ "$_rest" -ge 1 ] || _rest=1
-  poll_ready "$PF_URL" "$_rest" || die 4 "the app did not answer /readyz within $TIMEOUT (checked through a port-forward). Look at: kubectl -n $NS logs deploy/$REL-apsd"
-  [ "$DISCOVERED" = 0 ] || warn "the app is ready, but $BASE_URL does not answer from this machine (firewall, DNS or the Ingress controller still starting)"
+  poll_ready "$PF_URL" "$_rest" || die 4 "the app did not answer /readyz within $TIMEOUT (checked through a port-forward to apsd). Look at: kubectl -n $NS logs deploy/$REL-apsd"
+  [ "$DISCOVERED" = 0 ] || warn "the app is ready, but $POLL_URL does not answer from this machine (firewall, DNS, or Traefik still starting: kubectl -n $TRAEFIK_NS get pods -l app.kubernetes.io/name=traefik)"
 }
 
 # Sets IX_READY IX_TOTAL IX_SET IX_LINE; IX_TOTAL=-1 when plate solving is disabled (no index DaemonSet).
@@ -601,16 +816,15 @@ $_ready
 MSG
   if [ "$DISCOVERED" = 0 ]; then
     cat <<MSG
-             (no Ingress address was found; start a port-forward first)
-             kubectl -n $NS port-forward svc/$REL-web 8080:80
+             (no Traefik address was found: make the host names (routes.host and id.<routes.host>) resolve to Traefik;
+              for a local try: kubectl -n $TRAEFIK_NS port-forward svc/$TRAEFIK_SVC 8080:80 with routes.port=8080)
 MSG
   fi
   cat <<MSG
 
-  First user (whoever registers first becomes the owner; afterwards registration is closed):
-    - open the page and press "Create account", or
-    - curl -X POST $_url/v1/auth/register -H 'content-type: application/json' \\
-           -d '{"username":"you","password":"CHOOSE-A-PASSWORD"}'
+  First user: open it and create your account (the first account becomes the owner, a platform administrator).
+  Further sign-ups follow identity.registration (default first-user: closed after the first). Accounts, passwords and
+  passkeys live in the identity provider; its admin login is in the Secret aps-zitadel (see docs/install.md, Identity).
 
   Solve progress per node:   kubectl get nodes -L aps/index-set
   Upgrade:                   re-run this installer (same flags); data and secrets are kept
@@ -628,8 +842,18 @@ MSG
   fi
 }
 
+# The bundled identity provider is configured by a Job (project, OIDC clients, service account): wait for it, since the
+# first login needs it. Nothing to wait for with an external provider.
+wait_identity() {
+  [ "$(kc -n "$NS" get job -l app.kubernetes.io/component=identity-bootstrap -o name 2>/dev/null | grep -c .)" -gt 0 ] || return 0
+  say "Waiting for the identity provider bootstrap Job"
+  kc -n "$NS" wait --for=condition=complete job -l app.kubernetes.io/component=identity-bootstrap --timeout "$TIMEOUT" >&2 \
+    || die 4 "the identity bootstrap Job did not complete within $TIMEOUT. Look at: kubectl -n $NS logs job -l app.kubernetes.io/component=identity-bootstrap; kubectl -n $NS get pods -l app.kubernetes.io/name=zitadel"
+}
+
 post_install() {
   mark_crds
+  wait_identity
   wait_app
   report_indexes
   final_message
@@ -642,8 +866,10 @@ main() {
   trap 'exit 143' TERM
   [ -z "$BOOTSTRAP" ] || bootstrap
   preflight
+  resolve_traefik
   ensure_helm
   check_release_state
+  resolve_identity
   fetch_chart
   run_helm
   [ -z "$DRY_RUN" ] || { say "dry run: nothing was installed"; exit 0; }

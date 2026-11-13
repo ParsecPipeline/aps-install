@@ -149,7 +149,7 @@ confirm() {
     die 2 "no terminal to ask for confirmation on. Re-run with --yes (or APS_ASSUME_YES=1) to uninstall release \"$REL\" from namespace \"$NS\"."
   fi
   _what="the release \"$REL\" in namespace \"$NS\" (data is KEPT)"
-  [ -z "$PURGE_DATA" ] || _what="the release \"$REL\" in namespace \"$NS\" AND ALL ITS DATA (database, stored frames, secrets)"
+  [ -z "$PURGE_DATA" ] || _what="the release \"$REL\" in namespace \"$NS\" AND ALL ITS DATA (database, stored frames, accounts, secrets)"
   [ -z "$PURGE_CRDS" ] || _what="$_what AND the Argo CRDs (every Argo Workflow on the cluster)"
   [ -z "$PURGE_INDEXES" ] || _what="$_what AND the node-local astrometry indexes"
   [ -z "$REMOVE_K3S" ] || _what="$_what AND THEN THE WHOLE single-node k3s cluster with everything stored in it"
@@ -213,6 +213,8 @@ EOF
     kc -n "$NS" delete pvc -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/component in (pg,rustfs)" --wait --timeout=180s \
       || die 3 "could not delete the volumes; the Secret ${REL}-secrets was NOT deleted (they must be deleted together). Re-run with --purge-data."
     kc -n "$NS" delete secret "${REL}-secrets" --ignore-not-found || die 3 "could not delete the Secret ${REL}-secrets"
+    # The identity provider's Secrets (masterkey + config, the OIDC clients, apsd's service account) belong to the database just wiped.
+    kc -n "$NS" delete secret aps-zitadel aps-oidc-argo "${REL}-oidc-apsd" "${REL}-zitadel-svc" "${REL}-idp-provisioner" iam-admin iam-admin-pat --ignore-not-found >/dev/null 2>&1 || true
   fi
 
   if [ -n "$PURGE_CRDS" ]; then
