@@ -23,7 +23,8 @@ Usage: uninstall.sh [flags]
                          generated Secret <release>-secrets. Both go together, never one without the other.
   --purge-crds           ALSO delete the *.argoproj.io CRDs (this deletes every Argo Workflow on the cluster)
   --purge-indexes        ALSO empty the node-local astrometry index directory on every node that holds it and
-                         remove the node labels/annotations (runs a short pod per node)
+                         remove the node labels/annotations (runs a short privileged pod per node, in <ns>-system while that
+                         namespace exists, else in a temporary privileged namespace that is deleted afterwards)
   --index-image IMG      image for the purge pods (default: the release's index-fetcher image, read before uninstall)
   --remove-k3s           ALSO remove the single-node k3s that install.sh --bootstrap installed, last, by running its
                          k3s-uninstall.sh (needs root). This deletes the WHOLE cluster and all data stored in it, whatever
@@ -159,14 +160,14 @@ confirm() {
   case "$_ans" in y|Y|yes|YES) return 0 ;; *) die 2 "aborted by the user" ;; esac
 }
 
-purge_pod() { # purge_pod NODE IMAGE HOSTPATH: empty the hostPath on NODE with a one-shot pod pinned there
-  _node="$1"; _img="$2"; _path="$3"
+purge_pod() { # purge_pod NODE IMAGE HOSTPATH NAMESPACE: empty the hostPath on NODE with a one-shot pod pinned there
+  _node="$1"; _img="$2"; _path="$3"; _pns="$4"
   _pod="aps-index-purge-$(printf '%s' "$_node" | tr 'A-Z.' 'a-z-' | cut -c1-40)"
   _ov="{\"spec\":{\"nodeName\":\"$_node\",\"restartPolicy\":\"Never\",\"tolerations\":[{\"operator\":\"Exists\"}],\"securityContext\":{\"runAsUser\":0},\"containers\":[{\"name\":\"purge\",\"image\":\"$_img\",\"imagePullPolicy\":\"IfNotPresent\",\"command\":[\"sh\",\"-c\",\"find /indexes -mindepth 1 -delete\"],\"volumeMounts\":[{\"name\":\"indexes\",\"mountPath\":\"/indexes\"}]}],\"volumes\":[{\"name\":\"indexes\",\"hostPath\":{\"path\":\"$_path\",\"type\":\"DirectoryOrCreate\"}}]}}"
-  kc -n "$NS" delete pod "$_pod" --ignore-not-found >/dev/null 2>&1
-  kc -n "$NS" run "$_pod" --image "$_img" --restart=Never --overrides "$_ov" >/dev/null || return 1
-  kc -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$_pod" --timeout=180s >/dev/null || { kc -n "$NS" logs "$_pod" >&2; kc -n "$NS" delete pod "$_pod" --ignore-not-found >/dev/null 2>&1; return 1; }
-  kc -n "$NS" delete pod "$_pod" --ignore-not-found >/dev/null 2>&1
+  kc -n "$_pns" delete pod "$_pod" --ignore-not-found >/dev/null 2>&1
+  kc -n "$_pns" run "$_pod" --image "$_img" --restart=Never --overrides "$_ov" >/dev/null || return 1
+  kc -n "$_pns" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$_pod" --timeout=180s >/dev/null || { kc -n "$_pns" logs "$_pod" >&2; kc -n "$_pns" delete pod "$_pod" --ignore-not-found >/dev/null 2>&1; return 1; }
+  kc -n "$_pns" delete pod "$_pod" --ignore-not-found >/dev/null 2>&1
   say "emptied $_path on node $_node"
 }
 
@@ -179,10 +180,16 @@ cluster_uninstall() {
   kc get --raw /readyz >/dev/null 2>&1 || die 2 "the Kubernetes API of context \"$CUR_CTX\" is not reachable"
   ensure_helm
 
+  # The chart's work and system namespaces (names are values; the default is <ns>-work / <ns>-system).
+  WORK_NS="$NS-work"; SYS_NS="$NS-system"
+  _rv="$(hm get values "$REL" -n "$NS" -o yaml 2>/dev/null | awk '/^namespaces:/{n=1;next} /^[^ #]/{n=0} n&&$1=="work:"{w=$2} n&&$1=="system:"{s=$2} END{gsub(/"/,"",w);gsub(/"/,"",s);print w "|" s}')"
+  [ -z "${_rv%%|*}" ] || WORK_NS="${_rv%%|*}"
+  [ -z "${_rv#*|}" ] || SYS_NS="${_rv#*|}"
+
   # Read what the purge needs BEFORE the release (and with it the DaemonSet) disappears.
   IX_IMAGE=""; IX_PATH="${APS_INDEX_PATH:-/var/lib/aps/astrometry-index}"; IX_LABEL="aps/index-set"
   if [ -n "$PURGE_INDEXES" ]; then
-    if _info="$(kc -n "$NS" get ds "$REL-index-fetcher" -o 'jsonpath={.spec.template.spec.containers[0].image}|{.spec.template.spec.volumes[?(@.name=="indexes")].hostPath.path}|{.spec.template.spec.containers[0].env[?(@.name=="LABEL_KEY")].value}' 2>/dev/null)"; then
+    if _info="$(kc -n "$SYS_NS" get ds "$REL-index-fetcher" -o 'jsonpath={.spec.template.spec.containers[0].image}|{.spec.template.spec.volumes[?(@.name=="indexes")].hostPath.path}|{.spec.template.spec.containers[0].env[?(@.name=="LABEL_KEY")].value}' 2>/dev/null)"; then
       _i=""; _p=""; _l=""
       IFS='|' read -r _i _p _l <<EOF
 $_info
@@ -193,7 +200,7 @@ EOF
     # With --remove-k3s the single node is this host (root): the directory is emptied locally in remove_k3s, no pod needed.
     [ -n "$IX_IMAGE" ] || [ -n "$REMOVE_K3S" ] || die 2 "--purge-indexes needs the index-fetcher image and the release has no DaemonSet any more: pass --index-image <image>"
     IX_NODES="$(
-      { kc -n "$NS" get pods -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/component=index-fetcher" -o 'jsonpath={range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null
+      { kc -n "$SYS_NS" get pods -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/component=index-fetcher" -o 'jsonpath={range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null
         kc get nodes -l "$IX_LABEL" -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null; } | grep -v '^$' | sort -u)"
   fi
 
@@ -205,7 +212,7 @@ EOF
   fi
 
   # The verb WorkflowTemplates are post-install hooks: Helm does not track them, so remove them explicitly.
-  kc -n "$NS" delete workflowtemplates.argoproj.io -l "app.kubernetes.io/part-of=aps,app.kubernetes.io/instance=$REL" --ignore-not-found >/dev/null 2>&1 || true
+  kc -n "$WORK_NS" delete workflowtemplates.argoproj.io -l "app.kubernetes.io/part-of=aps,app.kubernetes.io/instance=$REL" --ignore-not-found >/dev/null 2>&1 || true
 
   if [ -n "$PURGE_DATA" ]; then
     # Volumes and Secret go together: a Secret without its volume (or the reverse) is a database nobody can open.
@@ -228,20 +235,42 @@ EOF
 
   if [ -n "$PURGE_INDEXES" ]; then
     _failed=0
+    # The privileged purge pod needs a namespace that allows hostPath + root: the system namespace if it is still there
+    # (the release is gone and so is it, usually), else a temporary privileged one that is always deleted afterwards.
+    PURGE_NS="$SYS_NS"; TMP_NS=""
+    if [ -n "$IX_NODES" ] && [ -n "$IX_IMAGE" ] && ! kc get namespace "$SYS_NS" >/dev/null 2>&1; then
+      TMP_NS="aps-purge-$$"; PURGE_NS="$TMP_NS"
+      kc create namespace "$TMP_NS" >/dev/null && kc label namespace "$TMP_NS" pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null \
+        || die 3 "cannot create the temporary namespace $TMP_NS for the purge pods"
+    fi
     for _n in $IX_NODES; do
       [ -n "$IX_IMAGE" ] || break
-      if purge_pod "$_n" "$IX_IMAGE" "$IX_PATH"; then
+      if purge_pod "$_n" "$IX_IMAGE" "$IX_PATH" "$PURGE_NS"; then
         kc label node "$_n" "$IX_LABEL-" >/dev/null 2>&1 || true
         kc annotate node "$_n" "${IX_LABEL%/*}/index-progress-" >/dev/null 2>&1 || true
       else
         warn "could not empty $IX_PATH on node $_n"; _failed=1
       fi
     done
+    [ -z "$TMP_NS" ] || kc delete namespace "$TMP_NS" --ignore-not-found --wait --timeout=120s >/dev/null 2>&1 || true
     [ "$_failed" = 0 ] || die 3 "some nodes could not be purged"
   fi
 
+  # The chart owns the work and system namespaces: helm uninstall removed them; sweep any that remain (after the purge, which
+  # may use the system namespace).
+  # Only namespaces that carry THIS release's Helm ownership annotations: a derived name can belong to someone else.
+  _sweep=""
+  for _n in "$WORK_NS" "$SYS_NS"; do
+    _o="$(kc get namespace "$_n" -o 'jsonpath={.metadata.annotations.meta\.helm\.sh/release-name}|{.metadata.annotations.meta\.helm\.sh/release-namespace}' 2>/dev/null)" || continue   # already gone
+    if [ "$_o" = "$REL|$NS" ]; then _sweep="$_sweep $_n"
+    else warn "namespace $_n exists but is not owned by release \"$REL\" (no matching meta.helm.sh annotations): leaving it alone"; fi
+  done
+  # shellcheck disable=SC2086
+  [ -z "$_sweep" ] || kc delete namespace $_sweep --ignore-not-found --wait --timeout=180s >/dev/null 2>&1 || warn "could not delete the namespaces$_sweep"
+
   say ""
-  say "Uninstalled release \"$REL\"."
+  if [ -n "$_sweep" ]; then say "Uninstalled release \"$REL\" (and its namespaces $WORK_NS and $SYS_NS)."
+  else say "Uninstalled release \"$REL\"."; fi
   _kept=""
   [ -n "$PURGE_DATA" ] || _kept="$_kept the data volumes and Secret ${REL}-secrets (--purge-data deletes them);"
   [ -n "$PURGE_CRDS" ] || _kept="$_kept the Argo CRDs (--purge-crds);"

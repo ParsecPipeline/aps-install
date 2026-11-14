@@ -18,7 +18,7 @@
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.3.1" # @version
+DEFAULT_VERSION="0.4.0" # @version
 
 # --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
 # TAG, live here on purpose (a checksum fetched from the host that serves the script proves nothing). The script is
@@ -129,7 +129,7 @@ NO_IDENTITY_VALUES=""
 NO_TRAEFIK_CHANGES="${APS_NO_TRAEFIK_CHANGES:-}"
 TRAEFIK_CHART_REPO="${APS_TRAEFIK_CHART_REPO:-https://traefik.github.io/charts}"   # the official Traefik chart repository (mirrors: set this)
 PROBE_WAIT="${APS_PROBE_WAIT:-30}"                                                  # seconds the sign-in probes keep trying
-TRAEFIK_REUSED=""; TRAEFIK_CTL=""; TLS_INFERRED=""
+TRAEFIK_REUSED=""; TRAEFIK_CTL=""; TLS_INFERRED=""; SEC_VALUES=""
 PLAIN_HTTP="${APS_PLAIN_HTTP:-}"
 BOOTSTRAP="${APS_BOOTSTRAP:-}"
 K3S_VERSION="${APS_K3S_VERSION:-}"
@@ -384,15 +384,9 @@ preflight() {
     [ "$(kc auth can-i create "$_res" 2>/dev/null)" = yes ] \
       || die 2 "your credentials may not create $_res (kubectl auth can-i create $_res: no). Argo Workflows installs CRDs and ClusterRoles; ask a cluster administrator or use a cluster-admin context."
   done
-  if kc get namespace "$NS" >/dev/null 2>&1; then
-    _pss="$(kc get namespace "$NS" -o 'jsonpath={.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null)"
-    case "$_pss" in
-      baseline|restricted) warn "namespace $NS enforces the \"$_pss\" Pod Security level: the per-node index fetcher (root, hostPath) will be rejected. Use a namespace without enforcement or set plateSolve.enabled=false." ;;
-    esac
-  else
-    [ "$(kc auth can-i create namespaces 2>/dev/null)" = yes ] \
-      || die 2 "namespace $NS does not exist and your credentials may not create it. Create it first or ask an administrator."
-  fi
+  # The chart creates the work and system namespaces itself and this script creates and labels the release namespace.
+  [ "$(kc auth can-i create namespaces 2>/dev/null)" = yes ] \
+    || die 2 "your credentials may not create namespaces (kubectl auth can-i create namespaces: no). The release namespace $NS, ${NS}-work and ${NS}-system are created for this install; create $NS first and ask an administrator for the other two, or use a cluster-admin context."
 
   # Storage: Postgres and the object store need PVCs.
   _sc="$(kc get storageclass -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null)"
@@ -418,6 +412,93 @@ preflight() {
       die 2 "Argo Workflows CRDs (workflows.argoproj.io) already exist and were not installed by release \"$REL\" in namespace \"$NS\". Installing would overwrite them with this chart's Argo version and may break another Argo on this cluster. Re-run with --adopt-argo-crds if that is what you want."
     fi
   fi
+}
+
+# ---------------------------------------------------------------- namespaces, Pod Security, network policy selectors
+# The release namespace is created and labelled HERE, before Helm (Helm cannot label the namespace it installs into): Pod
+# Security `restricted` enforced at the project's minimum Kubernetes version (a later cluster upgrade cannot suddenly reject
+# our pods). security.podSecurity.app (--set or a values file) picks another level (kind's hostPort Traefik needs `privileged`).
+# An existing stricter enforce level is never weakened. The work and system namespaces are the chart's (templates/namespaces.yaml).
+psa_rank() { case "$1" in restricted) echo 2 ;; baseline) echo 1 ;; *) echo 0 ;; esac; }
+
+# psa_file_value FILE KEY: security.podSecurity.KEY from a values file (block style only; use --set for flow style)
+psa_file_value() {
+  awk -v key="$2" '
+    /^security:/ { s = 1; p = 0; next }
+    /^[^ #]/ { s = 0; p = 0 }
+    s && /^  podSecurity:/ { p = 1; next }
+    s && /^  [^ #]/ { p = 0 }
+    s && p && $1 == key ":" { v = $0; sub(/^[^:]*: */, "", v); sub(/[ \t]+#.*$/, "", v); gsub(/^["\047]|["\047]$/, "", v); print v; exit }' "$1" 2>/dev/null
+}
+
+# psa_value KEY DEFAULT: what the user passed for security.podSecurity.KEY (--set wins, then the last -f file), else DEFAULT
+psa_value() {
+  _pv="$(set_value "security.podSecurity.$1")"
+  if [ -z "$_pv" ]; then
+    for _pf in $(printf '%s' "$HELM_USER" | tr ' ' '\n' | sed -n "/^'-f'\$/{n;s/^'\(.*\)'\$/\1/p;}"); do
+      _pfv="$(psa_file_value "$_pf" "$1")"
+      [ -z "$_pfv" ] || _pv="$_pfv"
+    done
+  fi
+  printf '%s' "${_pv:-$2}"
+}
+
+ensure_namespace() {
+  [ -z "$DRY_RUN" ] || return 0   # a dry run changes nothing
+  _want="$(psa_value app restricted)"
+  case "$_want" in privileged|baseline|restricted) ;; *) die 2 "security.podSecurity.app must be privileged, baseline or restricted, got \"$_want\"" ;; esac
+  _pver="$(psa_value appVersion v1.30)"
+  if ! kc get namespace "$NS" >/dev/null 2>&1; then
+    kc create namespace "$NS" >/dev/null || die 2 "cannot create namespace $NS"
+  fi
+  _cur="$(kc get namespace "$NS" -o 'jsonpath={.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null)"
+  _eff="$_want"
+  if [ "$(psa_rank "$_cur")" -gt "$(psa_rank "$_want")" ]; then
+    _eff="$_cur"; say "Namespace $NS already enforces Pod Security \"$_cur\": keeping it"
+  fi
+  kc label namespace "$NS" "pod-security.kubernetes.io/enforce=$_eff" "pod-security.kubernetes.io/enforce-version=$_pver" \
+    pod-security.kubernetes.io/audit=restricted pod-security.kubernetes.io/warn=restricted --overwrite >/dev/null \
+    || die 2 "cannot label namespace $NS with its Pod Security level"
+  say "Namespace $NS: Pod Security enforce=$_eff (version $_pver)"
+  [ "$_eff" != privileged ] || warn "namespace $NS does not enforce Pod Security (security.podSecurity.app=privileged): fine for a local kind cluster whose Traefik needs hostPorts, not for anything else."
+}
+
+# security_values: a generated values file (before the user's -f files) with the facts only this script knows: Argo's flags take
+# the work namespace as a literal (the chart cannot template a subchart's args), and a reused Traefik's pods are allowed through the
+# NetworkPolicies by its real namespace and label, and the API server's addresses (the chart reads them with `lookup`, which a
+# client-side `helm --dry-run` cannot do, and fails the render rather than open the API ports to everyone).
+security_values() {
+  SEC_VALUES=""
+  _work="$(user_value namespaces work)"; [ -n "$_work" ] || _work="$NS-work"
+  mk_tmp
+  SEC_VALUES="$TMP/security.yaml"
+  {
+    printf 'argo-workflows:\n  controller:\n    extraArgs: ["--managed-namespace", "%s"]\n  server:\n    extraArgs: ["--managed-namespace", "%s"]\n' "$_work" "$_work"
+    # A selector the user wrote is theirs: a merged map would AND both, so none is generated then.
+    _usel=""
+    printf '%s' "$HELM_USER" | grep -q 'networkPolicy.ingressController' && _usel=1
+    for _uf in $(printf '%s' "$HELM_USER" | tr ' ' '\n' | sed -n "/^'-f'\$/{n;s/^'\(.*\)'\$/\1/p;}"); do
+      grep -qs 'ingressController:' "$_uf" && _usel=1
+    done
+    _api=""; _cidrs=""
+    printf '%s' "$HELM_USER" | grep -q 'networkPolicy.apiServer' && _api=1
+    for _uf in $(printf '%s' "$HELM_USER" | tr ' ' '\n' | sed -n "/^'-f'\$/{n;s/^'\(.*\)'\$/\1/p;}"); do
+      grep -qs 'apiServer:' "$_uf" && _api=1
+    done
+    if [ -z "$_api" ]; then
+      _ips="$(kc -n default get endpoints kubernetes -o 'jsonpath={.subsets[*].addresses[*].ip}' 2>/dev/null)" || _ips=""
+      for _ip in $_ips; do
+        case "$_ip" in *:*) _cidrs="$_cidrs${_cidrs:+, }\"$_ip/128\"" ;; *) _cidrs="$_cidrs${_cidrs:+, }\"$_ip/32\"" ;; esac
+      done
+    fi
+    _ic=""
+    if [ -n "$TRAEFIK_REUSED" ] && [ -n "$TRAEFIK_CTL" ] && [ -z "$_usel" ]; then _ic=1; fi
+    if [ -n "${_cidrs:-}" ] || [ -n "$_ic" ]; then printf 'networkPolicy:\n'; fi   # one key: a duplicate would shadow the first
+    [ -z "${_cidrs:-}" ] || printf '  apiServer:\n    cidrs: [%s]\n' "$_cidrs"
+    if [ -n "$_ic" ]; then
+      printf '  ingressController:\n    namespaceSelector: {kubernetes.io/metadata.name: %s}\n    podSelector: {app.kubernetes.io/name: traefik}\n' "${TRAEFIK_CTL%%/*}"
+    fi
+  } > "$SEC_VALUES"
 }
 
 # ---------------------------------------------------------------- Traefik
@@ -516,7 +597,8 @@ aps_identity_values() {
   printf "        image: '{{ include \"aps.globalApsdImage\" . }}'\n"
   printf "        imagePullPolicy: '{{ .Values.global.imagePullPolicy }}'\n"
   printf '        restartPolicy: Always\n        command: ["/app/apsd", "forward", %s":%s", "%s"]\n' "$_iv_ftls" "$_iv_idpub" "$_iv_fwd"
-  printf '        securityContext: {runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}\n'
+  printf '        securityContext: {runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}\n'
+  printf '        resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 64Mi}}\n'
 }
 # END identity-values
 
@@ -976,8 +1058,9 @@ fetch_chart() {
 
 # ---------------------------------------------------------------- install
 run_helm() {
-  set -- upgrade --install "$REL" "$CHART_REF" -n "$NS" --create-namespace --wait --timeout "$TIMEOUT" --reset-then-reuse-values
+  set -- upgrade --install "$REL" "$CHART_REF" -n "$NS" --wait --timeout "$TIMEOUT" --reset-then-reuse-values
   if [ -n "$TRAEFIK_VALUES" ]; then set -- "$@" -f "$TRAEFIK_VALUES"; fi
+  if [ -n "$SEC_VALUES" ]; then set -- "$@" -f "$SEC_VALUES"; fi
   if [ -n "$ID_VALUES" ]; then set -- "$@" -f "$ID_VALUES"; fi
   if [ -n "$CHART_VERSIONED" ] && [ -n "$VERSION" ]; then set -- "$@" --version "$VERSION"; fi
   eval "set -- \"\$@\" $HELM_USER"
@@ -1239,6 +1322,8 @@ main() {
   [ -z "$BOOTSTRAP" ] || bootstrap
   preflight
   resolve_traefik
+  security_values
+  ensure_namespace
   ensure_helm
   check_release_state
   resolve_identity

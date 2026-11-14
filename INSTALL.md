@@ -76,10 +76,10 @@ It prints the app URL when it is done (open it and create your account: the firs
 | `kubectl` with a context for the cluster | the script talks to the API server | install kubectl; `--context NAME` picks a non-default context |
 | Kubernetes 1.30 or newer | the bundled Zitadel chart, native sidecars | checked, exit 2 |
 | A name for the app and one for the identity provider | OIDC redirects browsers between them (next section) | the script picks `aps.<node address>.sslip.io` when it can; otherwise exit 2 |
-| Permission to create CRDs, ClusterRoles and (if absent) the namespace | Argo installs CRDs; the index fetcher needs a ClusterRole (below) | checked, exit 2 with the missing verb; use a cluster-admin context |
+| Permission to create CRDs, ClusterRoles and namespaces | Argo installs CRDs; the index fetcher needs a ClusterRole (below); the install creates the release namespace and the chart creates `<ns>-work` and `<ns>-system` | checked, exit 2 with the missing verb; use a cluster-admin context |
 | A default StorageClass | Postgres (5 Gi) and the object store (10 Gi) use PVCs | warning; `--set global.storageClass=<name>` or use external services |
 | Traefik | the app is published through Traefik `IngressRoute`s | reused when found (k3s and microk8s ship one), otherwise the chart installs it (next section) |
-| hostPath volumes allowed in the namespace | the index fetcher keeps indexes in `/var/lib/aps/astrometry-index` on each node | warning if the namespace enforces Pod Security baseline/restricted |
+| hostPath volumes allowed in `<ns>-system` and (for the solve pods only, read-only) `<ns>-work` | the index fetcher keeps indexes in `/var/lib/aps/astrometry-index` on each node | the chart creates both namespaces with the right policy ([security.md](security.md)) |
 | Free disk on the nodes that will solve | `wide` preset ~0.3 GB; +4.6 GB for 5200-LITE; ~34 GB for everything | the fetcher refuses to fill a disk (`insufficient-disk` in its node annotation) |
 | Internet access from the nodes | image pulls from `ghcr.io`, Argo from `quay.io`, indexes from `data.astrometry.net` | see "Air-gapped and mirrored installs" |
 | linux/amd64 nodes | the published images are amd64 only | warning |
@@ -92,7 +92,7 @@ directory and verifies it against a SHA-256 table embedded in the script (not fe
 1. Preflight (all read-only; nothing is changed if it fails): context and server shown, API ready, version, permissions,
    StorageClass, node architectures, Pod Security of the namespace, foreign Argo CRDs, an interrupted Helm release, and the
    Traefik decision (found and reused, or installed by the chart; printed).
-2. `helm upgrade --install aps <chart> -n aps --create-namespace --wait --timeout 15m --reset-then-reuse-values ...`.
+2. `helm upgrade --install aps <chart> -n aps --wait --timeout 15m --reset-then-reuse-values ...`, after creating the release namespace and labelling it for Pod Security `restricted`.
    No `--atomic`: after an interruption (Ctrl-C, network) you re-run and it resumes with the images already pulled.
 3. Waits for `apsd` and the web UI, then polls `/readyz`.
 4. Reports the index download progress per node (it never blocks on it unless you pass `--wait-indexes`) and prints the URL,
@@ -203,7 +203,7 @@ off, so an administrator creates the accounts in its console. Programs use **per
 
 **Sessions and keys.** The browser holds one sealed cookie (`aps_session`: AES-GCM, HttpOnly, SameSite=Lax) with a short-lived
 access token that apsd verifies locally; the refresh token stays server-side. Sign-out and "sign out everywhere" end the sessions;
-a disabled user is cut off within 30 seconds, others within one access-token lifetime (`identity.accessTokenSeconds`, 300). The
+a disabled user is cut off on every replica within about a second, others within one access-token lifetime (`identity.accessTokenSeconds`, 300). The
 sealing keys are in the chart Secret (`cookie-key`, `cookie-key-previous`): to rotate, upgrade once with
 `--set identity.rotateCookieKeys=true` (existing sessions keep working), then drop the flag.
 
@@ -220,7 +220,7 @@ at startup, nothing to install or configure); albums, their frames, members, lin
 knobs on apsd (no chart value is needed): `APS_AUTHZ_LIST_TIMEOUT` (default `10s`, must stay under 30 s: a slower authorization lookup
 fails the request instead of returning a partial list) and `APS_AUTHZ_RECONCILE_INTERVAL` (default `10m`: how often the stored
 relationships are re-derived from the album tables, which also repairs a wiped `openfga` schema). Revoking a share takes effect at
-once on the replica that handled it and within about a second on the others; a revoked link stops working within 60 seconds.
+once on the replica that handled it and within about a second on the others; a revoked link stops working within about a second everywhere.
 
 ## Re-running, upgrading, rolling back
 
@@ -269,7 +269,7 @@ Pass overrides with `--set key=value` and/or `--values file.yaml` (repeatable; t
 | `global.storageClass` | cluster default | StorageClass of the Postgres and object-store PVCs |
 | `traefik.install` | unset (auto) | `true` installs Traefik with the release, `false` reuses the cluster's; `install.sh` decides when unset |
 | `routes.enabled`, `routes.host`, `routes.port` | on, `aps.localtest.me` | the IngressRoutes; `routes.host` is required (see Names), `routes.port` when the public port is not 80/443 |
-| `routes.maxBodySize` | `2g` | largest upload, enforced by apsd (`APS_MAX_BODY`) |
+| `uploads.*`, `reads.*` | 64g per file, 16Mi parts | the direct-to-store upload limit model and presigned read URLs: [docs/scale.md](scale.md) |
 | `routes.api/auth/web/identity.middlewares` | none | extra Traefik Middleware references per route (rate limits for `/auth` and the login, forward-auth) |
 | `tls.mode` | `none` | `none`, `certManager` (needs `routes.host`, `tls.certManager.issuerRef.name`), `secret` (`tls.secretName`) or `upstream` (TLS ends in front of Traefik; needs `routes.host`) |
 | `plateSolve.enabled` | `true` | per-node indexes + solving; `false` = no DaemonSet, no solve |
@@ -339,16 +339,13 @@ so they reuse it; kind, EKS, GKE and bare clusters get the chart's. Entrypoint n
 With `secret` or `certManager` the routes move to the `websecure` entrypoint, the plain-HTTP entrypoint redirects every request to HTTPS (permanent;
 `tls.redirectPort` when the public HTTPS port is not 443) and HSTS is sent (`routes.security.hstsSeconds`, 0 omits it).
 
-**Uploads and timeouts.** The upload size limit (`routes.maxBodySize`, default 2g) is enforced by `apsd` itself, which answers
-413 before reading an over-limit body, and not by Traefik. Traefik's only body limit is its `buffering` middleware, which reads
-the whole request into memory or onto disk before forwarding it (a multi-gigabyte upload would be written twice and stall) and
-buffers responses unless that is switched off, which also turns the limit off; so the chart renders no buffering middleware,
-uploads stream straight to `apsd` and the event streams are never held back. A `ServersTransport` gives the backend connection
-long timeouts (`traefik.timeouts`: dial 30s, response header 1h, idle 90s). The Traefik the chart installs also has no read/write
-timeout on its entrypoints.
+**Uploads and timeouts.** Files do not pass through `apsd`: the browser uploads parts straight to the object store on presigned URLs, which
+Traefik routes to the store by the pixel bucket's path (`<release>-store`). The limit model, part sizes and timeouts are in
+[docs/scale.md](scale.md). The chart renders no Traefik buffering middleware (it would spool whole responses and break event
+streams), and a `ServersTransport` gives the apsd connection long timeouts (`traefik.timeouts`).
 
 **Timeouts on a Traefik you reuse.** Traefik's entrypoint read timeout (60s by default) caps how long one request may take to arrive,
-which a multi-gigabyte upload over a slow link exceeds, and the write timeout cuts event streams. Raise them on that Traefik. On
+which one upload part over a slow link can exceed (see `uploads.partSize` in docs/scale.md), and the write timeout cuts event streams. Raise them on that Traefik. On
 k3s, `/var/lib/rancher/k3s/server/manifests/traefik-config.yaml`:
 
 ```yaml
@@ -420,7 +417,7 @@ indexes and the label yourself with `plateSolve.indexSource.mode=preSeeded`.
 | `helm` reports `pending-install` / `pending-upgrade` | an earlier run was killed. `helm rollback aps -n aps` (earlier revision exists) or `helm uninstall aps -n aps`, then re-run. Nothing was deleted. |
 | Install stops with "Argo Workflows CRDs already exist" | another Argo is on the cluster. This chart ships Argo v4 CRDs; installing overwrites them. Re-run with `--adopt-argo-crds` only if that is acceptable. |
 | A node keeps an image under two names after switching registries | the kubelet image record gotcha: on that node `crictl rmi <both names>` (or `microk8s ctr images rm`) and let it pull again. Do not mix a registry-qualified and an imported tag of the same image on one node. |
-| UI loads but uploads fail with 413 | the size limit is `routes.maxBodySize` (apsd's own, default 2g); a proxy or load balancer in front of Traefik may have a lower one. |
+| Uploads fail with 413 | the file is over `uploads.maxFileSize` (default 64g), or a proxy in front of Traefik caps request bodies below the part size (`uploads.partSize`). |
 | Uploads or event streams are cut after 60 s | the entrypoint timeouts of a Traefik you reuse: see "Timeouts on a Traefik you reuse". |
 | The install stops with "Traefik ... has no entrypoint \"identity\" on port ..." | `--no-traefik-changes` was given, or that Traefik is not Helm-installed / k3s's: make the change it prints (argument + published port), then re-run. See One host name only. |
 | Sign-in redirects to `https://<host>:<port>` and nothing answers | the identity port is not mapped: with `tls.mode=upstream` your TLS proxy / tunnel must forward that public port to Traefik's `identity` entrypoint (the installer prints the exact mapping); otherwise the port is not open on the node (firewall). |
