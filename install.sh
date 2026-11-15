@@ -18,7 +18,7 @@
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.4.0" # @version
+DEFAULT_VERSION="0.4.1" # @version
 
 # --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
 # TAG, live here on purpose (a checksum fetched from the host that serves the script proves nothing). The script is
@@ -1301,7 +1301,11 @@ MSG
 wait_identity() {
   [ "$(kc -n "$NS" get job -l app.kubernetes.io/component=identity-bootstrap -o name 2>/dev/null | grep -c .)" -gt 0 ] || return 0
   say "Waiting for the identity provider bootstrap Job"
-  kc -n "$NS" wait --for=condition=complete job -l app.kubernetes.io/component=identity-bootstrap --timeout "$TIMEOUT" >&2 \
+  # the Job is named per release revision: wait for the newest only (a Job left by an earlier, failed revision must not block)
+  _bj="$(kc -n "$NS" get job -l app.kubernetes.io/component=identity-bootstrap --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | tail -n 1)"
+  [ -n "$_bj" ] || _bj="job -l app.kubernetes.io/component=identity-bootstrap"
+  # shellcheck disable=SC2086
+  kc -n "$NS" wait --for=condition=complete $_bj --timeout "$TIMEOUT" >&2 \
     || die 4 "the identity bootstrap Job did not complete within $TIMEOUT. Look at: kubectl -n $NS logs job -l app.kubernetes.io/component=identity-bootstrap; kubectl -n $NS get pods -l app.kubernetes.io/name=zitadel"
 }
 
