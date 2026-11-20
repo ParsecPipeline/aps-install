@@ -455,6 +455,13 @@ Kubernetes RBAC cannot restrict a patch to the pod's own node or to one label; a
 follow-up (see the header of `templates/index-daemonset.yaml`). If you cannot accept this, set `plateSolve.enabled=false`, or pre-seed the
 indexes and the label yourself with `plateSolve.indexSource.mode=preSeeded`.
 
+## Plans and quotas
+
+By default every account is on the built-in `unlimited` plan and nothing is refused. To cap accounts, define plans in values
+(`metering.plans`, a list of `{name, entitlements: [...]}`; the format and the feature names are commented in `values.yaml`) and set
+`metering.defaultPlan`; the install fails when the default names no plan. Administrators assign plans on the Admin page. What is
+measured and how a quota behaves: [metering.md](metering.md).
+
 ## Monitoring
 
 Metrics, JSON logs and request ids are always on; nothing scrapes them by default. `--with-monitoring` adds a bundled

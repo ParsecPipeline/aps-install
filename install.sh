@@ -18,7 +18,7 @@
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.5.0" # @version
+DEFAULT_VERSION="0.6.0" # @version
 BRAND_NAME="Astro Pixel Platform" # @brand-name (generated from brand.yaml by deploy/helm/sync-brand.sh; this script is published alone)
 
 # --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
@@ -618,7 +618,15 @@ aps_identity_values() {
   if [ "$_iv_idpub" -lt 1024 ]; then
     printf '    podSecurityContext:\n      sysctls:\n        - {name: net.ipv4.ip_unprivileged_port_start, value: "0"}\n'
   fi
-  printf '    extraInitContainers:\n      - name: identity-forward\n'
+  # Before anything else: hold the pod until the identity bootstrap Job has written the OIDC client Secret (argo-server exits
+  # on a missing SSO Secret and the kubelet's restart backoff would leave Argo down for minutes after install).
+  printf '    extraInitContainers:\n      - name: wait-oidc-secret\n'
+  printf "        image: '{{ include \"aps.globalApsdImage\" . }}'\n"
+  printf "        imagePullPolicy: '{{ .Values.global.imagePullPolicy }}'\n"
+  printf '        command: ["/app/apsd", "wait-secret", "aps-oidc-argo"]\n'
+  printf '        securityContext: {runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}\n'
+  printf '        resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 64Mi}}\n'
+  printf '      - name: identity-forward\n'
   printf "        image: '{{ include \"aps.globalApsdImage\" . }}'\n"
   printf "        imagePullPolicy: '{{ .Values.global.imagePullPolicy }}'\n"
   printf '        restartPolicy: Always\n        command: ["/app/apsd", "forward", %s":%s", "%s"]\n' "$_iv_ftls" "$_iv_idpub" "$_iv_fwd"
@@ -1226,7 +1234,11 @@ wait_app() {
     APSD_ZERO=1
     return 0
   fi
-  for _d in api orchestrator web; do
+  # argo-server (every processing verb goes through it; with the Argo UI on it also holds for the identity bootstrap Secret)
+  # is waited for too, so "ready" never leaves Argo unreachable.
+  _ds="api orchestrator web"
+  ! kc -n "$NS" get deploy "$REL-argo-workflows-server" >/dev/null 2>&1 || _ds="$_ds argo-workflows-server"
+  for _d in $_ds; do
     kc -n "$NS" rollout status "deploy/$REL-$_d" --timeout "$TIMEOUT" >&2 \
       || die 4 "deployment $REL-$_d did not become ready within $TIMEOUT. Look at: kubectl -n $NS get pods; kubectl -n $NS describe pod -l app.kubernetes.io/instance=$REL"
   done
