@@ -18,7 +18,8 @@
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.4.1" # @version
+DEFAULT_VERSION="0.5.0" # @version
+BRAND_NAME="Astro Pixel Platform" # @brand-name (generated from brand.yaml by deploy/helm/sync-brand.sh; this script is published alone)
 
 # --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
 # TAG, live here on purpose (a checksum fetched from the host that serves the script proves nothing). The script is
@@ -44,6 +45,11 @@ Usage: install.sh [flags]
   --timeout DUR          helm --wait / readiness budget (default 15m; env APS_TIMEOUT)
   --wait-indexes[=DUR]   also wait (default 30m) for every eligible node to hold the astrometry indexes;
                          without it the install only reports index progress and never blocks on it
+  --domain NAME          the public name; every other name is derived from it (sets routes.host and domain.name)
+  --domain-mode MODE     subdomains (default with --domain): app on NAME, id.NAME, files.NAME (pixels, a separate origin), argo.NAME;
+                         single-host: one name, pixels under /<bucket>/ on it (limited origin isolation). Without --domain, the
+                         mode applies to the default (or routes.host) name: subdomains adds files.<name> only
+  --enrollment MODE      who may create an account: first-user (default), open, closed or invite (identity.enrollment)
   --url URL              the address users will open, overriding Traefik discovery (env APS_URL)
   --plain-http           the OCI chart registry speaks plain HTTP (a local/lab registry; env APS_PLAIN_HTTP=1)
   --bootstrap            bare Linux host with no reachable Kubernetes: first install single-node k3s (pinned version,
@@ -52,6 +58,8 @@ Usage: install.sh [flags]
                          A reachable cluster is left alone. Opt-in: without it Kubernetes is never installed (env APS_BOOTSTRAP=1)
   --k3s-version V        k3s release for --bootstrap (default pinned v1.34.13+k3s1; another version needs
                          APS_K3S_INSTALL_SHA256 = sha256 of that tag's install.sh; env APS_K3S_VERSION)
+  --with-monitoring      also install VictoriaMetrics and Grafana (metrics, dashboards); sign in to Grafana with the same account
+                         (platform administrators only). Sets observability.bundled.enabled=true
   --yes, -y              do not ask for confirmation (env APS_ASSUME_YES=1)
   --dry-run              pass --dry-run to helm (nothing is installed)
   --no-identity-values   do not generate the identity host values (routes.host, identity.host, the Zitadel external domain and the
@@ -136,6 +144,7 @@ K3S_VERSION="${APS_K3S_VERSION:-}"
 K3S_KUBECONFIG="${APS_K3S_KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"   # APS_K3S_KUBECONFIG is a test seam
 BOOT_WAIT="${APS_BOOTSTRAP_WAIT:-300}"                                # seconds per bootstrap wait (test seam)
 BOOTSTRAPPED=""                                                       # k3s-installed | k3s-existing
+DOMAIN=""; DOMAIN_MODE=""; ENROLLMENT=""; WITH_MONITORING=""
 HELM_USER=""   # user -f/--set flags, shell-quoted, in the order given
 HELM_BASE_URL="${APS_HELM_BASE_URL:-https://get.helm.sh}"
 TTY_DEV="${APS_TTY:-/dev/tty}"   # APS_TTY is a test seam
@@ -161,6 +170,10 @@ parse_args() {
       --url) [ $# -ge 2 ] || die 2 "--url needs a value"; URL_OVERRIDE="$2"; shift 2 ;;
       --wait-indexes) WAIT_INDEXES=1800; shift ;;
       --wait-indexes=*) WAIT_INDEXES="$(dur_secs "${1#*=}")" || die 2 "bad --wait-indexes duration: ${1#*=}"; shift ;;
+      --domain) [ $# -ge 2 ] || die 2 "--domain needs a value"; DOMAIN="$2"; shift 2 ;;
+      --domain-mode) [ $# -ge 2 ] || die 2 "--domain-mode needs a value"; DOMAIN_MODE="$2"; shift 2 ;;
+      --with-monitoring) WITH_MONITORING=1; shift ;;
+      --enrollment) [ $# -ge 2 ] || die 2 "--enrollment needs a value"; ENROLLMENT="$2"; shift 2 ;;
       --yes|-y) ASSUME_YES=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       --no-identity-values) NO_IDENTITY_VALUES=1; shift ;;
@@ -173,6 +186,18 @@ parse_args() {
       *) usage >&2; die 2 "unknown argument: $1" ;;
     esac
   done
+  case "$DOMAIN_MODE" in ""|subdomains|single-host) ;; *) die 2 "--domain-mode must be subdomains or single-host, got: $DOMAIN_MODE" ;; esac
+  case "$ENROLLMENT" in ""|first-user|open|closed|invite) ;; *) die 2 "--enrollment must be first-user, open, closed or invite, got: $ENROLLMENT" ;; esac
+  case "$DOMAIN" in *[!A-Za-z0-9.-]*) die 2 "--domain must be a plain host name (letters, digits, dots, dashes), got: $DOMAIN" ;; esac
+  if [ -n "$DOMAIN" ]; then
+    _rh="$(set_value routes.host)"
+    { [ -z "$_rh" ] || [ "$_rh" = "$DOMAIN" ]; } || die 2 "--domain $DOMAIN and --set routes.host=$_rh disagree: use one of them"
+    [ -n "$_rh" ] || { add_user "--set"; add_user "routes.host=$DOMAIN"; }
+    add_user "--set"; add_user "domain.name=$DOMAIN"
+  fi
+  [ -z "$DOMAIN_MODE" ] || { add_user "--set"; add_user "domain.mode=$DOMAIN_MODE"; }
+  [ -z "$ENROLLMENT" ] || { add_user "--set"; add_user "identity.enrollment=$ENROLLMENT"; }
+  [ -z "$WITH_MONITORING" ] || { add_user "--set"; add_user "observability.bundled.enabled=true"; }
   TIMEOUT_S="$(dur_secs "$TIMEOUT")" || die 2 "bad --timeout duration: $TIMEOUT (use 90s, 15m, 1h)"
   if [ -n "$BOOTSTRAP" ] && [ -n "$CTX" ]; then
     die 2 "--bootstrap installs a new local k3s cluster and cannot be combined with --context (that names an existing cluster)"
@@ -704,6 +729,10 @@ resolve_identity() {
   _argo=path
   case "$HELM_USER" in *argoUI.enabled=false*) _argo=off ;; esac
   _ah="$(user_value argoUI host)"; [ -z "$_ah" ] || _argo="host=$_ah"
+  # a domain.name with domain.mode subdomains (its default) puts the Argo UI on argo.<name>, as the chart expects; without a
+  # domain.name (--domain-mode alone on the default sslip.io host) the Argo UI stays on its path
+  _dm="$(user_value domain mode)"; _dn="$(user_value domain name)"
+  [ -z "$_dn" ] || [ "$_dm" = single-host ] || [ "$_argo" != path ] || _argo="host=argo.$_h"
   _target=""
   if [ "$_tls" = 1 ] && [ "${_ti:-$(set_value traefik.install)}" != true ]; then
     _ts="$(kc get svc -A -l app.kubernetes.io/name=traefik -o 'jsonpath={range .items[*]}{.metadata.name}.{.metadata.namespace}.svc{"\n"}{end}' 2>/dev/null | head -n 1)"
@@ -1170,11 +1199,11 @@ EOF
   DISCOVERED=1
 }
 
-# Temporary port-forward to apsd (it answers /readyz itself); sets PF_URL.
+# Temporary port-forward to the API (it answers /readyz itself); sets PF_URL.
 start_portforward() {
   PF_URL=""
   mk_tmp
-  kubectl ${CTX:+--context "$CTX"} -n "$NS" port-forward "svc/$REL-apsd" :80 </dev/null >"$TMP/pf.out" 2>&1 &
+  kubectl ${CTX:+--context "$CTX"} -n "$NS" port-forward "svc/$REL-api" :80 </dev/null >"$TMP/pf.out" 2>&1 &
   PF_PID=$!
   _n=0
   while [ "$_n" -lt 30 ]; do
@@ -1186,18 +1215,18 @@ start_portforward() {
 }
 
 wait_app() {
-  # apsd.replicaCount=0 (e.g. while restoring a database before the first start): nothing can answer /readyz, so do
+  # api.replicaCount=0 (e.g. while restoring a database before the first start): nothing can answer /readyz, so do
   # not wait for the app; only the web Deployment is checked.
-  _rep="$(kc -n "$NS" get deploy "$REL-apsd" -o 'jsonpath={.spec.replicas}' 2>/dev/null)" || _rep=""
+  _rep="$(kc -n "$NS" get deploy "$REL-api" -o 'jsonpath={.spec.replicas}' 2>/dev/null)" || _rep=""
   if [ "$_rep" = 0 ]; then
-    say "apsd is scaled to 0 replicas (apsd.replicaCount=0): not waiting for the app to answer; scale it up to start serving."
+    say "the API is scaled to 0 replicas (api.replicaCount=0): not waiting for the app to answer; scale it up to start serving."
     kc -n "$NS" rollout status "deploy/$REL-web" --timeout "$TIMEOUT" >&2 \
       || die 4 "deployment $REL-web did not become ready within $TIMEOUT. Look at: kubectl -n $NS get pods"
     discover_url
     APSD_ZERO=1
     return 0
   fi
-  for _d in apsd web; do
+  for _d in api orchestrator web; do
     kc -n "$NS" rollout status "deploy/$REL-$_d" --timeout "$TIMEOUT" >&2 \
       || die 4 "deployment $REL-$_d did not become ready within $TIMEOUT. Look at: kubectl -n $NS get pods; kubectl -n $NS describe pod -l app.kubernetes.io/instance=$REL"
   done
@@ -1208,9 +1237,9 @@ wait_app() {
     [ "$TIMEOUT_S" -gt "$_b1" ] || die 4 "the app did not answer $POLL_URL/readyz within $TIMEOUT"
     warn "$POLL_URL/readyz does not answer from this machine yet; checking the app through a port-forward instead"
   fi
-  start_portforward || die 4 "could not open a port-forward to svc/$REL-apsd"
+  start_portforward || die 4 "could not open a port-forward to svc/$REL-api"
   _rest=$((TIMEOUT_S - 1)); [ "$_rest" -ge 1 ] || _rest=1
-  poll_ready "$PF_URL" "$_rest" || die 4 "the app did not answer /readyz within $TIMEOUT (checked through a port-forward to apsd). Look at: kubectl -n $NS logs deploy/$REL-apsd"
+  poll_ready "$PF_URL" "$_rest" || die 4 "the app did not answer /readyz within $TIMEOUT (checked through a port-forward to the API). Look at: kubectl -n $NS logs deploy/$REL-api (and deploy/$REL-orchestrator)"
   [ "$DISCOVERED" = 0 ] || warn "the app is ready, but $POLL_URL does not answer from this machine (firewall, DNS, or Traefik still starting: kubectl -n $TRAEFIK_NS get pods -l app.kubernetes.io/name=traefik)"
 }
 
@@ -1258,9 +1287,9 @@ report_indexes() {
 
 final_message() {
   if [ "$DISCOVERED" = 1 ]; then _url="$BASE_URL"; else _url="http://localhost:8080"; fi
-  _ready="Astro Pixel Platform is ready."
-  [ -z "${UPSTREAM_REQUIRED:-}" ] || _ready="Astro Pixel Platform is installed. The public https address could not be reached from this machine, so the TLS proxy / tunnel mapping below is unverified: sign-in works once it is in place (REQUIRED)."
-  [ "${APSD_ZERO:-0}" != 1 ] || _ready="Astro Pixel Platform is installed, with apsd scaled to 0 (it does not serve yet: re-run without apsd.replicaCount=0)."
+  _ready="${BRAND_NAME} is ready."
+  [ -z "${UPSTREAM_REQUIRED:-}" ] || _ready="${BRAND_NAME} is installed. The public https address could not be reached from this machine, so the TLS proxy / tunnel mapping below is unverified: sign-in works once it is in place (REQUIRED)."
+  [ "${APSD_ZERO:-0}" != 1 ] || _ready="${BRAND_NAME} is installed, with apsd scaled to 0 (it does not serve yet: re-run without api.replicaCount=0)."
   cat <<MSG
 
 $_ready
@@ -1274,10 +1303,22 @@ MSG
 MSG
   fi
   if [ "${TLS_MODE:-}" = upstream ] && [ "${IDENTITY_CHECK:-}" = 1 ]; then print_upstream_mapping; fi
+  if [ -n "$WITH_MONITORING" ]; then
+    # own host (grafana.<name>) in subdomains mode, else the /grafana/ path on the app host
+    _gurl="$_url/grafana/"
+    if [ -n "$(user_value domain name)" ] && [ "$(user_value domain mode)" != single-host ] && [ -n "${PUBLIC_HOST:-}" ]; then
+      _gurl="$(printf '%s/' "$_url" | sed "s#://$PUBLIC_HOST#://grafana.$PUBLIC_HOST#")"
+    fi
+    cat <<MSG
+
+  Grafana:   $_gurl
+             (sign in with your platform account; platform administrators only)
+MSG
+  fi
   cat <<MSG
 
   First user: open it and create your account (the first account becomes the owner, a platform administrator).
-  Further sign-ups follow identity.registration (default first-user: closed after the first). Accounts, passwords and
+  Further sign-ups follow identity.enrollment (default first-user: closed after the first). Accounts, passwords and
   passkeys live in the identity provider; its admin login is in the Secret aps-zitadel (see docs/install.md, Identity).
 
   Solve progress per node:   kubectl get nodes -L aps/index-set

@@ -217,11 +217,11 @@ EOF
   if [ -n "$PURGE_DATA" ]; then
     # Volumes and Secret go together: a Secret without its volume (or the reverse) is a database nobody can open.
     say "Deleting the data volumes and the Secret ${REL}-secrets"
-    kc -n "$NS" delete pvc -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/component in (pg,rustfs)" --wait --timeout=180s \
+    kc -n "$NS" delete pvc -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/component in (pg,rustfs,victoriametrics)" --wait --timeout=180s \
       || die 3 "could not delete the volumes; the Secret ${REL}-secrets was NOT deleted (they must be deleted together). Re-run with --purge-data."
     kc -n "$NS" delete secret "${REL}-secrets" --ignore-not-found || die 3 "could not delete the Secret ${REL}-secrets"
     # The identity provider's Secrets (masterkey + config, the OIDC clients, apsd's service account) belong to the database just wiped.
-    kc -n "$NS" delete secret aps-zitadel aps-oidc-argo "${REL}-oidc-apsd" "${REL}-zitadel-svc" "${REL}-idp-provisioner" iam-admin iam-admin-pat --ignore-not-found >/dev/null 2>&1 || true
+    kc -n "$NS" delete secret aps-zitadel aps-oidc-argo aps-oidc-grafana "${REL}-oidc-apsd" "${REL}-zitadel-svc" "${REL}-idp-provisioner" iam-admin iam-admin-pat --ignore-not-found >/dev/null 2>&1 || true
   fi
 
   if [ -n "$PURGE_CRDS" ]; then

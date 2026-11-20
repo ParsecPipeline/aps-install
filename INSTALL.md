@@ -30,6 +30,9 @@ kubeconfig, writes only to a temporary directory it removes on exit, and runs `h
 | `--chart DIR\|TGZ`, `--chart-url URL`, `--version V` | install a local or downloaded chart instead of the published OCI chart |
 | `--context NAME` | kubectl/helm context (`KUBECONFIG` is honoured) |
 | `--url URL` | the address this machine reaches the cluster at (an IP becomes `aps.<ip>.sslip.io` as the public name); overrides Traefik discovery. `--url https://NAME[:PORT]` with no `tls.mode` and no certificate configured means TLS ends in front of the cluster: the installer sets `tls.mode=upstream`, `routes.host=NAME` and says so |
+| `--domain NAME`, `--domain-mode MODE` | one public name, everything else derived (below): `subdomains` (default with a domain) or `single-host` |
+| `--enrollment MODE` | who may create an account: `first-user` (default), `open`, `closed` or `invite` (`identity.enrollment`; an admin can change it later) |
+| `--with-monitoring` | also install the bundled VictoriaMetrics + Grafana (`observability.bundled.enabled`); Grafana is at `grafana.<name>` (subdomains) or `/grafana/`, sign-in through the identity provider, platform administrators only |
 | `--no-traefik-changes` | never modify a Traefik you reuse: with one host name (below) the installer stops before installing and prints the exact change instead |
 | `--no-identity-values` | do not generate the identity host values (Zitadel external domain, Argo SSO): you supply them (see Names) |
 | `--timeout DUR`, `--wait-indexes[=DUR]` | readiness budget; optionally wait for the astrometry indexes on every node |
@@ -102,6 +105,17 @@ Exit codes: 0 ok, 2 preflight or usage problem (nothing installed), 3 Helm faile
 app did not become ready in time, or sign-in cannot work (the identity provider is not served where browsers are sent).
 
 ### Names: hosts, ports and TLS
+
+**One setting: `--domain NAME`** (chart values `domain.name`, `domain.mode`) derives every name. In `subdomains` mode (the
+default once a domain is given) the app and API are on `NAME`, the identity provider on `id.NAME`, the Argo UI on `argo.NAME`
+and the pixels (thumbnails, tiles, downloads, upload parts, all presigned URLs) on `files.NAME`, a **separate origin** from
+the app: the browser calls it cross-origin, Traefik answers its CORS for the app origin only, and a hostile file served from it
+cannot script the app. Point `NAME`, `id.NAME`, `files.NAME` and `argo.NAME` at the cluster (a wildcard record does it) and, with
+a certificate (`tls.mode=certManager`), the Certificate lists them all. In `single-host` mode there is one name and the pixels
+are under `/<bucket>/` on it; origin isolation is then limited (pixels share the app's origin). `--domain-mode subdomains`
+without `--domain` applies to the default `aps.<address>.sslip.io` name and adds `files.<name>` only (sslip.io resolves any
+prefix). Without either flag nothing changes: `routes.host` as below, single-host. An external object store is its own origin
+in both modes. The finer-grained settings follow.
 
 The app and the identity provider need **two public names that the browser resolves**, for example `aps.example.org` (the app,
 `routes.host`) and `id.aps.example.org` (the bundled Zitadel, `identity.host`, default `id.<routes.host>`): the identity
@@ -195,10 +209,11 @@ apsd stores no passwords. It is an OpenID Connect client (authorization code + P
   any other client that signs people in at the same provider (`identity.external.interactiveClients`), so their user tokens are not
   mistaken for machines (those tokens never create an account; accounts are created at apsd's own login under the admission policy).
 
-**The first user.** `identity.registration` is `first-user` by default: the first person to sign in becomes the owner (the bundled
+**The first user.** `identity.enrollment` is `first-user` by default: the first person to sign in becomes the owner (the bundled
 mode grants them `platform-admin`; external mode relies on your claim), after that apsd refuses accounts it has not seen (HTTP 403 at
-the callback). `open` lets every user the provider authenticates in; `closed` also switches the bundled Zitadel's self-registration
-off, so an administrator creates the accounts in its console. Programs use **personal access tokens** (account page, or
+the callback). `open` lets every user the provider authenticates in; `invite` admits a new account only with an invite link from an administrator;
+`closed` admits nobody new and also switches the bundled Zitadel's self-registration off. The value only seeds the mode on the first
+start: an administrator changes it later with `PUT /v1/admin/enrollment` (audited), and the stored mode wins. Programs use **personal access tokens** (account page, or
 `POST /v1/me/tokens`; scopes `read`, `write`, `process`) as `Authorization: Bearer aps_pat_...`, or an IdP client-credentials JWT.
 
 **Sessions and keys.** The browser holds one sealed cookie (`aps_session`: AES-GCM, HttpOnly, SameSite=Lax) with a short-lived
@@ -209,6 +224,30 @@ sealing keys are in the chart Secret (`cookie-key`, `cookie-key-previous`): to r
 
 **Opt-in provisioner.** `--set identity.provisioner.enabled=true` also creates a machine user that can create users (Secret
 `<release>-idp-provisioner`, key `pat`; ORG_OWNER plus the instance role IAM_LOGIN_CLIENT, which Zitadel requires for the Session API; it can only be created by the FIRST install, since the install's instance-admin credential is locked down after it): the install smoke uses it (`deploy/dev/values-smoke.yaml` sets it); leave it off otherwise, it is a standing credential.
+
+**Login providers (bundled mode).** People can sign in with an account they already have. Under `identity.providers` enable
+`google` or `github`, or list generic `oidc` issuers and `saml` providers. A provider never carries a secret value: it names a
+Kubernetes Secret you create first, for example
+`kubectl -n aps create secret generic google-oidc --from-literal=client-secret=...`, then
+`--set identity.providers.google.enabled=true --set identity.providers.google.clientId=ID --set identity.providers.google.clientSecret.existingSecret=google-oidc`.
+A SAML entry names a Secret holding `metadata.xml` (or a `metadataUrl`). At the provider register the redirect URI
+`<identity public URL>/idps/callback`. The bootstrap Job reads the mounted Secret (never logging it) and manages the providers it
+created by name in the organisation's login policy, so a provider dropped from the values is removed on the next upgrade and one
+added in the console is left alone. `identity.providers.linkByEmail` (default off) links a sign-in to the existing account with the
+same email; turn it on only for providers whose emails you trust. The sign-in page takes the platform's name and colours from
+`brand.yaml`. Enrollment still applies: a new person arriving through a provider is admitted or refused by the mode below. With
+`identity.mode=external` add providers at your own issuer instead. The bootstrap needs two service-account memberships,
+`ORG_USER_MANAGER` (disable and enable users) and `ORG_SETTINGS_MANAGER` (login policy and branding); a cluster bootstrapped by an
+earlier release gets them on the next bootstrap re-run (upgrade), or add them once in the Zitadel console.
+
+**Administration.** Platform administrators get an **Administration** page (`/admin`) with four tabs: users (status, last sign-in,
+frames, albums and storage; disable, enable, sign out everywhere, delete the account and its data), enrollment (the sign-up mode),
+invites and the audit log. It is the face of the `/v1/admin` API (administrator sessions only: personal access tokens and links
+are refused), and every change and every read is written to the audit log; an administrator cannot disable or delete themselves,
+and machine and service accounts are listed but cannot be changed (409). **Invites** are single-use links (`/invite/<token>`,
+shown once at creation, stored hashed) that admit one new account in `invite` mode; an invite made for an email only works for a
+sign-in with that verified email, and expires or is revoked from the same tab. Deleting an account removes its frames, objects,
+albums and shares and its identity-provider user; clean-up that cannot finish at once is queued and retried.
 
 ### Sharing (albums)
 
@@ -221,6 +260,15 @@ knobs on apsd (no chart value is needed): `APS_AUTHZ_LIST_TIMEOUT` (default `10s
 fails the request instead of returning a partial list) and `APS_AUTHZ_RECONCILE_INTERVAL` (default `10m`: how often the stored
 relationships are re-derived from the album tables, which also repairs a wiped `openfga` schema). Revoking a share takes effect at
 once on the replica that handled it and within about a second on the others; a revoked link stops working within about a second everywhere.
+
+**Public albums.** An album's owner (or an editor) can also publish it: anyone with the address `/a/<slug>` can then view it without an
+account, with a link preview (Open Graph and Twitter metadata) for chat and social sites. Anonymous viewers get previews and zoomable
+tiles only; the original files (whose headers can carry the observing site and notes) are a separate per-album switch, off by default.
+Publicity is per album: a frame in a public album is not readable through any other route or album. A private, missing and
+un-published address are the same 404; un-publishing takes effect at once and the address stays dead (publishing again makes a new
+one). Both changes are in the audit log. The anonymous endpoints are rate limited per client address (30 requests/s, burst 300),
+per apsd replica; with `routes.enabled` the path `/a/` is routed to apsd with the rest of the sharing paths. An anonymous visitor
+never causes a render: a frame whose preview has not been made yet answers 202 until a signed-in viewer opens it.
 
 ## Re-running, upgrading, rolling back
 
@@ -278,11 +326,11 @@ Pass overrides with `--set key=value` and/or `--values file.yaml` (repeatable; t
 | `plateSolve.indexes.nodeSelector/tolerations` | none | which nodes hold indexes and serve solves (tainted nodes are skipped unless tolerated) |
 | `identity.mode` | `bundled` | `bundled` (Zitadel) or `external` (your OIDC provider; see Identity) |
 | `identity.host` | `id.<routes.host>` | the bundled identity provider's host name, or `name:port` for the same host on another port |
-| `identity.registration` | `first-user` | `first-user`, `open`, `closed` |
+| `identity.enrollment` | `first-user` | `first-user`, `open`, `closed`, `invite` (seeds the mode; editable at runtime by an admin) |
 | `identity.accessTokenSeconds`, `identity.sessionTTL` | `300`, `720h` | access-token lifetime (revocation latency) and browser session lifetime |
 | `identity.provisioner.enabled` | `false` | the opt-in user-provisioning machine user |
 | `idp.*` | | the Zitadel subchart (resources, replicas); the host keys under `idp.zitadel.configmapConfig` come from `identity-values.sh` |
-| `apsd.autoSolve`, `apsd.autoExtractMeta`, `apsd.autoRender` | `true` | process every upload automatically; `autoRender` renders its Library thumbnail (and the thumbnail of every stack/calibrate product). Tile pyramids are rendered on a frame's first view whatever this says |
+| `api.autoSolve`, `api.autoExtractMeta`, `api.autoRender` | `true` | process every upload automatically; `autoRender` renders its Library thumbnail (and the thumbnail of every stack/calibrate product). Tile pyramids are rendered on a frame's first view whatever this says |
 | `db.mode`, `objectStore.mode` | `incluster` | `external` for your own Postgres (needs pg_sphere) / S3 |
 | `secrets.existingSecret` | generated | bring your own credentials Secret |
 
@@ -388,7 +436,7 @@ secrets:
   existingSecret: my-aps-credentials     # s3-access-key, s3-secret-key
 ```
 
-The database needs the `pg_sphere` extension and a direct or session-mode connection (apsd's leader election is an advisory lock).
+The database needs the `pg_sphere` extension and a direct or session-mode connection (the orchestrator's leader election is an advisory lock).
 
 ### Secrets and GitOps
 
@@ -407,6 +455,13 @@ Kubernetes RBAC cannot restrict a patch to the pod's own node or to one label; a
 follow-up (see the header of `templates/index-daemonset.yaml`). If you cannot accept this, set `plateSolve.enabled=false`, or pre-seed the
 indexes and the label yourself with `plateSolve.indexSource.mode=preSeeded`.
 
+## Monitoring
+
+Metrics, JSON logs and request ids are always on; nothing scrapes them by default. `--with-monitoring` adds a bundled
+VictoriaMetrics and Grafana (platform administrators sign in through the identity provider; the installer prints the URL). With an
+external identity provider also pass `observability.bundled.grafana.oidc.*`. A cluster that already runs Prometheus uses
+`metrics.serviceMonitor` instead. Details, traces and reading a request id: [observability.md](observability.md).
+
 ## Troubleshooting
 
 | Symptom | What to do |
@@ -424,8 +479,8 @@ indexes and the label yourself with `plateSolve.indexSource.mode=preSeeded`.
 | `helm` fails with "a Traefik controller is already running" | a plain `helm install` found another Traefik: add `--set traefik.install=false` (or use `install.sh`, which decides). |
 | The install finished but the printed URL does not open | the script checked apsd through a port-forward and warned that the Traefik address does not answer from the installing machine: check DNS/firewall and that Traefik has an address (`kubectl get svc -A -l app.kubernetes.io/name=traefik`), or use the `port-forward` command it prints. |
 | The page redirects to the identity provider and the browser cannot resolve `id.<host>` | both names must resolve for the browser: DNS, `/etc/hosts`, or the `sslip.io` default. `*.localhost` and `*.localtest.me` resolve to loopback. |
-| Sign-in fails with "sign-ups are closed" | `identity.registration=first-user` and someone already signed in: `--set identity.registration=open`, or sign in with the first account. |
-| apsd or argo-server `Pending`/`CreateContainerConfigError` right after install | they wait for the Secrets the bootstrap Job writes: `kubectl -n aps get job -l app.kubernetes.io/component=identity-bootstrap`, `kubectl -n aps logs job -l app.kubernetes.io/component=identity-bootstrap`, `kubectl -n aps get pods -l app.kubernetes.io/name=zitadel`. |
+| Sign-in fails with "sign-ups are closed" | `identity.enrollment=first-user` and someone already signed in: an administrator sets the mode to `open` or `invite` (`PUT /v1/admin/enrollment`), or sign in with the first account. |
+| the API, orchestrator or argo-server `Pending`/`CreateContainerConfigError` right after install | they wait for the Secrets the bootstrap Job writes: `kubectl -n aps get job -l app.kubernetes.io/component=identity-bootstrap`, `kubectl -n aps logs job -l app.kubernetes.io/component=identity-bootstrap`, `kubectl -n aps get pods -l app.kubernetes.io/name=zitadel`. |
 | `helm` fails: `idp.zitadel.configmapConfig.ExternalDomain is ... but the identity host is ...` | the host values disagree: regenerate them with `deploy/helm/identity-values.sh` (or let `install.sh` do it). |
 | `helm upgrade` fails on Zitadel's `init`/`setup` Job ("field is immutable") | delete the two finished Jobs first (`kubectl -n aps delete job aps-zitadel-init aps-zitadel-setup`); `install.sh` does this for you. |
 | `install.sh` hangs waiting for the Traefik Service | a `LoadBalancer` Service on a cluster without a load balancer never gets an address: `--set traefikController.service.spec.type=NodePort` (and re-run), or install a load balancer. |
