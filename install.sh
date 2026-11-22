@@ -18,7 +18,7 @@
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.6.0" # @version
+DEFAULT_VERSION="0.7.0" # @version
 BRAND_NAME="Astro Pixel Platform" # @brand-name (generated from brand.yaml by deploy/helm/sync-brand.sh; this script is published alone)
 
 # --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
@@ -28,6 +28,10 @@ BRAND_NAME="Astro Pixel Platform" # @brand-name (generated from brand.yaml by de
 # checksum file. Another version needs APS_K3S_INSTALL_SHA256 (the sha256 of that tag's install.sh).
 PINNED_K3S_VERSION="v1.34.13+k3s1"
 K3S_INSTALL_SHA256_PINNED="40b487f0d8ef4f5d1bf422e7bb6228cc7789c40ecc66c5ab067d396bbee9816e"
+# The same release's binary and airgap image tarball (linux/amd64), from its sha256sum-amd64.txt; the offline bundle ships them
+# (deploy/airgap/publish-bundle.sh verifies both against these before publishing; --airgap --bootstrap uses them).
+K3S_BINARY_SHA256_PINNED="b9a7c47aab81db66d0253378ddea0d06f8a6dca4dace7a26db3f00fa2f0e3717"
+K3S_AIRGAP_SHA256_PINNED="c10a9f07c357cfc41488f29c15872621ac8664c9864b3d1148a10155c9a1c2ff"
 
 usage() {
   cat <<'USAGE'
@@ -52,6 +56,22 @@ Usage: install.sh [flags]
   --enrollment MODE      who may create an account: first-user (default), open, closed or invite (identity.enrollment)
   --url URL              the address users will open, overriding Traefik discovery (env APS_URL)
   --plain-http           the OCI chart registry speaks plain HTTP (a local/lab registry; env APS_PLAIN_HTTP=1)
+  --download-bundle DIR  on a connected machine (needs only curl and sha256sum): download this release's offline bundle (images,
+                         chart, Helm, k3s files; format in deploy/airgap/FORMAT.md) into DIR as an OCI image layout, every byte
+                         verified against the bundle digest stamped into this script. --version V picks another release and then
+                         needs --bundle-digest sha256:... (also required for unstamped development copies; env APS_BUNDLE_DIGEST)
+  --indexes SET          with --download-bundle: also fetch the astrometry index set (wide | 5200-lite | full; the aps-indexes artifact,
+                         deploy/airgap/FORMAT.md) into DIR/indexes/SET, digest-verified and resumable (env APS_INDEXES_REPO). With --airgap:
+                         seed this node's index directory from that set instead of the bundled wide files, and apply the set's chart profile
+  --indexes-digest D     the manifest digest (sha256:...) the index set must have: required for a set this script has no stamped digest
+                         for (development copies, unreleased sets); env APS_INDEXES_DIGEST. Never a way to skip verification
+  --airgap DIR           install with no internet from a bundle written by --download-bundle: verifies the bundle (digest stamped into
+                         this script, every blob), loads the images into k3s or microk8s on this host (or --registry), uses the bundled
+                         Helm and chart, seeds the wide astrometry indexes (plateSolve.indexSource.mode=preSeeded) and never pulls an
+                         image. Needs --domain, --url or --set routes.host (there is no sslip.io offline); --bootstrap installs k3s
+                         from the bundle. Only this node is loaded/seeded: repeat on other nodes or use --registry
+  --registry HOST        with --airgap: push the images (skopeo) to HOST/<name> instead of importing them; the cluster must then pull the
+                         original names from it (containerd registry mirror)
   --bootstrap            bare Linux host with no reachable Kubernetes: first install single-node k3s (pinned version,
                          checksum-verified installer, its bundled Traefik is the ingress), wait for the node, use
                          /etc/rancher/k3s/k3s.yaml, then install normally. Needs root (curl ... | sudo sh -s -- --bootstrap).
@@ -180,6 +200,12 @@ parse_args() {
       --no-traefik-changes) NO_TRAEFIK_CHANGES=1; shift ;;
       --adopt-argo-crds) ADOPT_CRDS=1; shift ;;
       --plain-http) PLAIN_HTTP=1; shift ;;
+      --download-bundle) [ $# -ge 2 ] || die 2 "--download-bundle needs a directory"; DOWNLOAD_BUNDLE="$2"; shift 2 ;;
+      --bundle-digest) [ $# -ge 2 ] || die 2 "--bundle-digest needs a value"; BUNDLE_DIGEST="$2"; BUNDLE_DIGEST_GIVEN=1; shift 2 ;;
+      --indexes-digest) [ $# -ge 2 ] || die 2 "--indexes-digest needs a value"; INDEXES_DIGEST="$2"; shift 2 ;;
+      --indexes) [ $# -ge 2 ] || die 2 "--indexes needs a set name"; INDEXES_SET="$2"; valid_index_set "$INDEXES_SET" || die 2 "--indexes: unknown set '$INDEXES_SET' (wide | 5200-lite | full)"; shift 2 ;;
+      --airgap) [ $# -ge 2 ] || die 2 "--airgap needs the bundle directory"; AIRGAP="$2"; shift 2 ;;
+      --registry) [ $# -ge 2 ] || die 2 "--registry needs a host[:port]"; REG_HOST="$2"; shift 2 ;;
       --bootstrap) BOOTSTRAP=1; shift ;;
       --k3s-version) [ $# -ge 2 ] || die 2 "--k3s-version needs a value"; K3S_VERSION="$2"; shift 2 ;;
       --help|-h) usage; exit 0 ;;
@@ -198,6 +224,8 @@ parse_args() {
   [ -z "$DOMAIN_MODE" ] || { add_user "--set"; add_user "domain.mode=$DOMAIN_MODE"; }
   [ -z "$ENROLLMENT" ] || { add_user "--set"; add_user "identity.enrollment=$ENROLLMENT"; }
   [ -z "$WITH_MONITORING" ] || { add_user "--set"; add_user "observability.bundled.enabled=true"; }
+  [ -z "$AIRGAP" ] || [ -z "$DOWNLOAD_BUNDLE" ] || die 2 "--airgap installs from a bundle and --download-bundle fetches one: run them on different machines"
+  [ -n "$AIRGAP" ] || [ -z "$REG_HOST" ] || die 2 "--registry only applies to --airgap"
   TIMEOUT_S="$(dur_secs "$TIMEOUT")" || die 2 "bad --timeout duration: $TIMEOUT (use 90s, 15m, 1h)"
   if [ -n "$BOOTSTRAP" ] && [ -n "$CTX" ]; then
     die 2 "--bootstrap installs a new local k3s cluster and cannot be combined with --context (that names an existing cluster)"
@@ -302,6 +330,7 @@ check_ports_free() {
 install_k3s() {
   _v="${K3S_VERSION:-$PINNED_K3S_VERSION}"
   _want="${APS_K3S_INSTALL_SHA256:-}"
+  if [ -n "$AIRGAP" ]; then airgap_install_k3s; return 0; fi
   if [ -z "$_want" ]; then
     [ "$_v" = "$PINNED_K3S_VERSION" ] \
       || die 2 "no embedded checksum for the k3s $_v installer (only $PINNED_K3S_VERSION); set APS_K3S_INSTALL_SHA256 to the sha256 of that tag's install.sh"
@@ -632,6 +661,14 @@ aps_identity_values() {
   printf '        restartPolicy: Always\n        command: ["/app/apsd", "forward", %s":%s", "%s"]\n' "$_iv_ftls" "$_iv_idpub" "$_iv_fwd"
   printf '        securityContext: {runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}\n'
   printf '        resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 64Mi}}\n'
+  # Last: hold the pod until Zitadel answers ready, so an upgrade that restarts Zitadel does not make argo-server fail its OIDC
+  # discovery and exit (a restart the smoke counts).
+  printf '      - name: wait-issuer\n'
+  printf "        image: '{{ include \"aps.globalApsdImage\" . }}'\n"
+  printf "        imagePullPolicy: '{{ .Values.global.imagePullPolicy }}'\n"
+  printf '        command: ["/app/apsd", "wait-http", "http://%s-zitadel:8080/debug/ready"]\n' "$_iv_rel"
+  printf '        securityContext: {runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}\n'
+  printf '        resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 64Mi}}\n'
 }
 # END identity-values
 
@@ -718,7 +755,12 @@ resolve_identity() {
       # --url http://host[:port] says it all; an IP address cannot carry the identity provider's own name, so it becomes
       # aps.<ip>.sslip.io (the URL is still where this machine reaches the cluster)
       _h="$_uh"; [ -z "$_up" ] || _p="$_up"
-      case "$_h" in *[!0-9.]*|"") ;; *.*.*.*) _h="aps.$_h.sslip.io" ;; esac
+      # Offline (--airgap) there is no sslip.io: the IP stays the host and the identity provider takes its own port on it (one host).
+      case "$_h" in *[!0-9.]*|"") ;; *.*.*.*)
+        if [ -n "$AIRGAP" ]; then
+          _iphost=1
+          [ -n "$(user_value identity host)" ] || { add_user "--set"; add_user "identity.host=$_h:8444"; }
+        else _h="aps.$_h.sslip.io"; fi ;; esac
     fi
   fi
   if [ -z "$_h" ] && [ -n "$(release_value identity host)" ]; then
@@ -737,6 +779,13 @@ resolve_identity() {
   _argo=path
   case "$HELM_USER" in *argoUI.enabled=false*) _argo=off ;; esac
   _ah="$(user_value argoUI host)"; [ -z "$_ah" ] || _argo="host=$_ah"
+  # An IP address as the host: argo-server reaches the identity provider by mapping the public NAME to its in-pod forwarder
+  # (hostAliases), which cannot redirect an IP. So the Argo UI (its SSO) is off on an IP host; workflows are unaffected (the
+  # orchestrator uses its ServiceAccount token). A host name brings it back.
+  if [ "${_iphost:-0}" = 1 ] && [ "$_argo" = path ]; then
+    _argo=off
+    warn "the Argo UI is off: its sign-in needs a host name, not an IP address ($_h). Processing is unaffected. Use --url http://NAME (a name that resolves to this node) to have it."
+  fi
   # a domain.name with domain.mode subdomains (its default) puts the Argo UI on argo.<name>, as the chart expects; without a
   # domain.name (--domain-mode alone on the default sslip.io host) the Argo UI stays on its path
   _dm="$(user_value domain mode)"; _dn="$(user_value domain name)"
@@ -1371,21 +1420,559 @@ post_install() {
   final_message
 }
 
+# ---------------------------------------------------------------- --download-bundle: the offline bundle, fetched with curl + sha256sum
+# Format: deploy/airgap/FORMAT.md. Speaks the OCI distribution API directly (anonymous pull token, manifests by digest, blobs
+# with the CDN redirect and resume), verifies every byte against its digest and writes an OCI image layout. Nothing is
+# trusted but the root digest stamped into this script (or given with --bundle-digest): content addressing does the rest.
+
+# json_flat: JSON on stdin -> one `path<TAB>value` line per scalar (path = keys and array indexes joined by "/", like
+# manifests/0/platform/architecture). jq when present, otherwise a small awk parser (same output; APS_NO_JQ=1 forces it).
+json_flat() {
+  if [ -z "${APS_NO_JQ:-}" ] && command -v jq >/dev/null 2>&1; then
+    jq -r 'paths(scalars) as $p | (($p | map(tostring) | join("/")) + "\t" + (getpath($p) | tostring))'
+    return
+  fi
+  awk '
+    { s = s $0 "\n" }
+    END {
+      n = length(s); d = 0; i = 1
+      while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":") { i++; continue }
+        if (c == "{") { d++; t[d] = "o"; k[d] = ""; ek[d] = 1; i++; continue }
+        if (c == "[") { d++; t[d] = "a"; k[d] = 0; ek[d] = 0; i++; continue }
+        if (c == "}" || c == "]") { d--; i++; continue }
+        if (c == ",") { if (t[d] == "a") k[d]++; else ek[d] = 1; i++; continue }
+        if (c == "\"") {
+          v = ""; i++
+          while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == "\\") { v = v c substr(s, i + 1, 1); i += 2; continue }
+            if (c == "\"") break
+            v = v c; i++
+          }
+          i++
+          if (t[d] == "o" && ek[d]) { k[d] = v; ek[d] = 0; continue }
+        } else {
+          v = ""
+          while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == "," || c == "}" || c == "]" || c == " " || c == "\n" || c == "\t" || c == "\r") break
+            v = v c; i++
+          }
+        }
+        p = k[1]; for (j = 2; j <= d; j++) p = p "/" k[j]
+        printf "%s\t%s\n", p, v
+      }
+    }'
+}
+
+# jget FLATFILE PATH: the value at PATH ("" when absent).
+jget() { awk -F'\t' -v p="$2" '$1 == p { print $2; exit }' "$1"; }
+# jcount PREFIX FLATFILE: how many array elements PREFIXN/... exist (PREFIX ends with "/").
+jcount() { awk -F'\t' -v p="$1" 'BEGIN { m = -1 } index($1, p) == 1 { split(substr($1, length(p) + 1), a, "/"); if (a[1] + 0 > m) m = a[1] + 0 } END { print m + 1 }' "$2"; }
+
+# The root digest of this release's offline bundle, stamped at publish time (deploy/airgap/publish-bundle.sh).
+BUNDLE_DIGEST_STAMPED="sha256:f0614afb163a3868e0dad06beefa189b80ff7ffb0aeb0b86ef953667afd794f7" # @bundle-digest
+# The manifest digests of the published astrometry index sets ("SET=sha256:... SET=sha256:..."), stamped at release time from
+# deploy/airgap/index-sets.lock. A set is never read by tag alone: its manifest must match this list or --indexes-digest.
+INDEX_SET_DIGESTS_STAMPED="wide=sha256:f2567eedf4b6d4d1ce614a091cbcec98b0a999cd2b1bd5445de5a4dcdd8d267e" # @index-set-digests
+INDEXES_DIGEST="${APS_INDEXES_DIGEST:-}"
+BUNDLE_DIGEST="${APS_BUNDLE_DIGEST:-}"; BUNDLE_DIGEST_GIVEN="${APS_BUNDLE_DIGEST:+1}"
+BUNDLE_REPO="${APS_BUNDLE_REPO:-parsecpipeline/aps-bundle}"
+BUNDLE_REGISTRY="${APS_BUNDLE_REGISTRY:-https://ghcr.io}"   # a test/lab seam; plain http is accepted only for loopback hosts
+BUNDLE_ARCH="amd64"
+DOWNLOAD_BUNDLE=""; INDEXES_SET=""; REG_REPO=""
+INDEXES_REPO="${APS_INDEXES_REPO:-${BUNDLE_REPO%/*}/aps-indexes}"
+BREG_REALM=""; BREG_SERVICE=""
+DL_ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+
+valid_digest() { printf '%s' "$1" | grep -Eq '^sha256:[0-9a-f]{64}$'; }
+digest_of() { sha256sum < "$1" | cut -d' ' -f1; }   # the hex sha256 of a file
+blob_ok() { [ -f "$1" ] && [ "$(digest_of "$1")" = "${2#sha256:}" ]; }   # blob_ok FILE DIGEST
+
+# Anonymous pull token for the bundle repository from the realm the registry announced (one repository holds the whole bundle).
+reg_token() {
+  curl -fsS -o "$TMP/tok.json" "$BREG_REALM?service=$BREG_SERVICE&scope=repository:${REG_REPO:-$BUNDLE_REPO}:pull" || return 1
+  json_flat < "$TMP/tok.json" | awk -F'\t' '$1 == "token" || $1 == "access_token" { print $2; exit }'
+}
+
+reg_probe() {
+  case "$BUNDLE_REGISTRY" in
+    https://*) ;;
+    http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;;
+    *) die 2 "the bundle registry must be an https:// URL (plain http only for loopback), got: $BUNDLE_REGISTRY" ;;
+  esac
+  curl -sS -D "$TMP/probe.h" -o /dev/null "$BUNDLE_REGISTRY/v2/" || die 2 "cannot reach the registry at $BUNDLE_REGISTRY (this step needs outbound network)"
+  _ch="$(tr -d '\r' < "$TMP/probe.h" | sed -n 's/^[Ww][Ww][Ww]-[Aa]uthenticate: *//p' | head -1)"
+  [ -n "$_ch" ] || return 0
+  case "$_ch" in [Bb]earer*) ;; *) die 2 "the registry asks for credentials ($_ch); anonymous download is not possible here" ;; esac
+  BREG_REALM="$(printf '%s' "$_ch" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')"
+  BREG_SERVICE="$(printf '%s' "$_ch" | sed -n 's/.*service="\([^"]*\)".*/\1/p')"
+  [ -n "$BREG_REALM" ] || die 2 "cannot read the registry's token realm from: $_ch"
+}
+
+# reg_fetch KIND DIGEST DEST: download manifests|blobs/DIGEST of the bundle repository into DEST (resumes a .part file), verified by digest.
+# The pull token is fetched once and reused; a failed attempt drops it, so an expired token is renewed.
+BREG_TOK=""
+reg_fetch() {
+  _kind="$1"; _dg="$2"; _dest="$3"; _repo="${REG_REPO:-$BUNDLE_REPO}"
+  valid_digest "$_dg" || die 3 "malformed digest in the bundle: $_dg"
+  if [ -f "$_dest" ]; then blob_ok "$_dest" "$_dg" && return 0; rm -f "$_dest"; fi
+  _tries=0; _fresh=0
+  while [ "$_tries" -lt 4 ]; do
+    _tries=$((_tries + 1))
+    [ -z "$BREG_REALM" ] || [ -n "$BREG_TOK" ] || BREG_TOK="$(reg_token)" || BREG_TOK=""
+    [ -z "$BREG_REALM" ] || [ -n "$BREG_TOK" ] || { sleep "${APS_DL_RETRY_WAIT:-2}"; continue; }
+    _tok="$BREG_TOK"
+    set -- -fsSL -C - -o "$_dest.part"
+    [ "$_kind" != manifests ] || set -- "$@" -H "Accept: $DL_ACCEPT"
+    [ -z "$_tok" ] || set -- "$@" -H "Authorization: Bearer $_tok"
+    _rc=0; curl "$@" "$BUNDLE_REGISTRY/v2/$_repo/$_kind/$_dg" || _rc=$?
+    if blob_ok "$_dest.part" "$_dg"; then mv "$_dest.part" "$_dest"; return 0; fi
+    if [ "$_rc" = 0 ]; then   # complete but wrong: never resume onto it
+      rm -f "$_dest.part"; _fresh=$((_fresh + 1))
+      [ "$_fresh" -lt 2 ] || die 3 "digest mismatch for $_repo $_kind/$_dg (the registry served different bytes); refusing it"
+    else
+      BREG_TOK=""; sleep "${APS_DL_RETRY_WAIT:-2}"
+    fi
+  done
+  die 3 "download of $_repo $_kind/$_dg failed after $_tries attempts (re-run to resume)"
+}
+
+# dl_image_manifest DIGEST: one image manifest, its config and layers.
+dl_image_manifest() {
+  _m="$DL_DIR/blobs/sha256/${1#sha256:}"
+  reg_fetch manifests "$1" "$_m"
+  json_flat < "$_m" > "$TMP/m.flat"
+  _cfg="$(jget "$TMP/m.flat" config/digest)"
+  _nl="$(jcount layers/ "$TMP/m.flat")"; _i=0
+  { [ -z "$_cfg" ] || echo "$_cfg"
+    while [ "$_i" -lt "$_nl" ]; do jget "$TMP/m.flat" "layers/$_i/digest"; _i=$((_i + 1)); done; } > "$TMP/layers.$$"
+  while read -r _ld; do
+    reg_fetch blobs "$_ld" "$DL_DIR/blobs/sha256/${_ld#sha256:}"
+  done < "$TMP/layers.$$"
+  rm -f "$TMP/layers.$$"
+}
+
+# dl_image DIGEST: an image (index or manifest): all of its linux/$BUNDLE_ARCH content; other platforms and attestations are skipped.
+dl_image() {
+  _ix="$DL_DIR/blobs/sha256/${1#sha256:}"
+  reg_fetch manifests "$1" "$_ix"
+  json_flat < "$_ix" > "$TMP/ix.flat"
+  _nc="$(jcount manifests/ "$TMP/ix.flat")"
+  if [ "$_nc" = 0 ]; then dl_image_manifest "$1"; return; fi
+  : > "$TMP/kids.$$"; _i=0
+  while [ "$_i" -lt "$_nc" ]; do
+    if [ "$(jget "$TMP/ix.flat" "manifests/$_i/platform/os")/$(jget "$TMP/ix.flat" "manifests/$_i/platform/architecture")" = "linux/$BUNDLE_ARCH" ]; then
+      jget "$TMP/ix.flat" "manifests/$_i/digest" >> "$TMP/kids.$$"
+    fi
+    _i=$((_i + 1))
+  done
+  [ -s "$TMP/kids.$$" ] || die 3 "image $1 has no linux/$BUNDLE_ARCH manifest"
+  while read -r _kd; do dl_image_manifest "$_kd"; done < "$TMP/kids.$$"
+  rm -f "$TMP/kids.$$"
+}
+
+# dl_files DIGEST: the artifact manifest (application/vnd.aps.bundle.v1): each layer is a file, named by its title.
+dl_files() {
+  _am="$DL_DIR/blobs/sha256/${1#sha256:}"
+  reg_fetch manifests "$1" "$_am"
+  json_flat < "$_am" > "$TMP/a.flat"
+  _nl="$(jcount layers/ "$TMP/a.flat")"; _i=0
+  mkdir -p "$DL_DIR/files"
+  while [ "$_i" -lt "$_nl" ]; do
+    _ld="$(jget "$TMP/a.flat" "layers/$_i/digest")"
+    _title="$(jget "$TMP/a.flat" "layers/$_i/annotations/org.opencontainers.image.title")"
+    printf '%s' "$_title" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || die 3 "bundle file with an unusable name: '$_title'"
+    reg_fetch blobs "$_ld" "$DL_DIR/blobs/sha256/${_ld#sha256:}"
+    ln -sf "../blobs/sha256/${_ld#sha256:}" "$DL_DIR/files/$_title"
+    say "  file $_title"
+    _i=$((_i + 1))
+  done
+}
+
+download_bundle() {
+  _miss=""
+  for _t in curl sha256sum; do command -v "$_t" >/dev/null 2>&1 || _miss="$_miss $_t"; done
+  [ -z "$_miss" ] || die 2 "--download-bundle needs curl and sha256sum on PATH (missing:$_miss)"
+  [ -n "$BUNDLE_DIGEST" ] || BUNDLE_DIGEST="$BUNDLE_DIGEST_STAMPED"
+  [ -n "$BUNDLE_DIGEST" ] || die 2 "this copy of install.sh has no stamped bundle digest (a development copy): pass --bundle-digest sha256:... (the digest the release notes list)"
+  valid_digest "$BUNDLE_DIGEST" || die 2 "--bundle-digest must look like sha256:<64 hex digits>, got: $BUNDLE_DIGEST"
+  if [ -z "$BUNDLE_DIGEST_GIVEN" ] && [ -n "$VERSION" ] && [ "$VERSION" != "$DEFAULT_VERSION" ]; then
+    die 2 "--version $VERSION is not the version this script was published with ($DEFAULT_VERSION): pass --bundle-digest for that release's bundle, or use that release's install.sh"
+  fi
+  mk_tmp
+  DL_DIR="$DOWNLOAD_BUNDLE"
+  mkdir -p "$DL_DIR/blobs/sha256" || die 2 "cannot create $DL_DIR"
+  reg_probe
+  say "Downloading bundle $BUNDLE_REPO@$BUNDLE_DIGEST into $DL_DIR"
+  reg_fetch manifests "$BUNDLE_DIGEST" "$DL_DIR/blobs/sha256/${BUNDLE_DIGEST#sha256:}"
+  cp "$DL_DIR/blobs/sha256/${BUNDLE_DIGEST#sha256:}" "$DL_DIR/bundle-index.json"
+  json_flat < "$DL_DIR/bundle-index.json" > "$TMP/root.flat"
+  [ "$(jget "$TMP/root.flat" mediaType)" = "application/vnd.oci.image.index.v1+json" ] || die 3 "the bundle root is not an OCI image index"
+  _bv="$(jget "$TMP/root.flat" annotations/io.aps.bundle.version)"
+  [ -z "$VERSION" ] || [ -z "$_bv" ] || [ "$_bv" = "$VERSION" ] || die 3 "the bundle is version $_bv, not $VERSION"
+  _bn="$(jcount manifests/ "$TMP/root.flat")"; _bi=0; : > "$TMP/entries"
+  while [ "$_bi" -lt "$_bn" ]; do
+    _bp="manifests/$_bi"
+    _bdg="$(jget "$TMP/root.flat" $_bp/digest)"; _bmt="$(jget "$TMP/root.flat" $_bp/mediaType)"; _bsz="$(jget "$TMP/root.flat" $_bp/size)"
+    _brole="$(jget "$TMP/root.flat" $_bp/annotations/io.aps.bundle.role)"
+    _bref="$(jget "$TMP/root.flat" $_bp/annotations/org.opencontainers.image.ref.name)"
+    _bos="$(jget "$TMP/root.flat" $_bp/platform/os)"; _bar="$(jget "$TMP/root.flat" $_bp/platform/architecture)"
+    _bi=$((_bi + 1))
+    if [ -n "$_bar$_bos" ] && [ "$_bos/$_bar" != "linux/$BUNDLE_ARCH" ]; then say "[$_bi/$_bn] skipping $_bref ($_bos/$_bar is not linux/$BUNDLE_ARCH)"; continue; fi
+    valid_digest "$_bdg" || die 3 "bundle entry $_bi has a malformed digest"
+    printf '%s' "$_bmt" | grep -Eq '^[A-Za-z0-9./+-]+$' || die 3 "bundle entry $_bi has a malformed mediaType"
+    printf '%s' "$_bsz" | grep -Eq '^[0-9]+$' || die 3 "bundle entry $_bi has a malformed size"
+    case "$_brole" in
+      image)
+        printf '%s' "$_bref" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:/@-]*$' || die 3 "bundle entry $_bi has no usable image reference"
+        say "[$_bi/$_bn] $_bref"
+        dl_image "$_bdg"
+        printf '{"mediaType":"%s","digest":"%s","size":%s,"annotations":{"org.opencontainers.image.ref.name":"%s","io.aps.bundle.role":"image"}}\n' "$_bmt" "$_bdg" "$_bsz" "$_bref" >> "$TMP/entries" ;;
+      files)
+        say "[$_bi/$_bn] bundle files"
+        dl_files "$_bdg"
+        printf '{"mediaType":"%s","digest":"%s","size":%s,"annotations":{"io.aps.bundle.role":"files"}}\n' "$_bmt" "$_bdg" "$_bsz" >> "$TMP/entries" ;;
+      *) die 3 "bundle entry $_bi has an unknown role '$_brole'" ;;
+    esac
+  done
+  printf '%s\n' '{"imageLayoutVersion":"1.0.0"}' > "$DL_DIR/oci-layout"
+  { printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":['
+    awk 'NR > 1 { printf "," } { printf "%s", $0 }' "$TMP/entries"
+    printf ']}\n'; } > "$DL_DIR/index.json"
+  say "Bundle ready in $DL_DIR (root $BUNDLE_DIGEST). Install offline with: install.sh --airgap $DL_DIR"
+  [ -z "$INDEXES_SET" ] || download_indexes
+}
+
+# valid_index_set NAME: the sets deploy/airgap/publish-indexes.sh publishes (profile per set: index_profile).
+valid_index_set() { case "$1" in wide|5200-lite|full) return 0 ;; *) return 1 ;; esac; }
+index_profile() { case "$1" in wide) echo index-wide.yaml ;; 5200-lite) echo index-5200lite.yaml ;; full) echo index-full.yaml ;; esac; }
+
+# index_set_want: the manifest digest the set INDEXES_SET must have (--indexes-digest, else the stamped list); refuses when there is none.
+index_set_want() {
+  _w="$INDEXES_DIGEST"
+  if [ -z "$_w" ]; then
+    for _e in $INDEX_SET_DIGESTS_STAMPED; do [ "${_e%%=*}" = "$INDEXES_SET" ] && _w="${_e#*=}"; done
+  fi
+  [ -n "$_w" ] || die 2 "this copy of install.sh has no stamped digest for the index set $INDEXES_SET (a development copy, or a set published after this release): pass --indexes-digest sha256:... (the digest deploy/airgap/publish-indexes.sh printed or the release notes list)"
+  valid_digest "$_w" || die 2 "--indexes-digest must look like sha256:<64 hex digits>, got: $_w"
+  printf '%s' "$_w"
+}
+
+# download_indexes: the set artifact <owner>/aps-indexes:SET into DIR/indexes/SET (manifest.json, blobs/sha256/<hex>, files/<title>).
+# The manifest is fetched by its pinned digest (stamped list or --indexes-digest) and refused unless its bytes hash to it; every file is
+# then verified against the digest and size the manifest lists.
+download_indexes() {
+  _want="$(index_set_want)" || exit $?
+  REG_REPO="$INDEXES_REPO"; BREG_TOK=""
+  _xd="$DL_DIR/indexes/$INDEXES_SET"
+  mkdir -p "$_xd/blobs/sha256" "$_xd/files" || die 2 "cannot create $_xd"
+  say "Downloading index set $INDEXES_REPO:$INDEXES_SET into $_xd"
+  _tries=0; : > "$TMP/set.json"
+  while :; do
+    _tries=$((_tries + 1))
+    [ -z "$BREG_REALM" ] || [ -n "$BREG_TOK" ] || BREG_TOK="$(reg_token)" || BREG_TOK=""
+    set -- -fsSL -o "$TMP/set.json" -H "Accept: application/vnd.oci.image.manifest.v1+json"
+    [ -z "$BREG_TOK" ] || set -- "$@" -H "Authorization: Bearer $BREG_TOK"
+    curl "$@" "$BUNDLE_REGISTRY/v2/$INDEXES_REPO/manifests/$_want" && break
+    [ "$_tries" -lt 4 ] || die 2 "cannot read the index set $INDEXES_REPO:$INDEXES_SET (published? run deploy/airgap/publish-indexes.sh $INDEXES_SET)"
+    BREG_TOK=""; sleep "${APS_DL_RETRY_WAIT:-2}"
+  done
+  _md="sha256:$(digest_of "$TMP/set.json")"
+  [ "$_md" = "$_want" ] || die 3 "the index set manifest is $_md, not the pinned $_want: refusing it (the registry served other bytes, or the set was republished)"
+  cp "$TMP/set.json" "$_xd/blobs/sha256/${_md#sha256:}"; cp "$TMP/set.json" "$_xd/manifest.json"
+  json_flat < "$_xd/manifest.json" > "$TMP/set.flat"
+  [ "$(jget "$TMP/set.flat" mediaType)" = "application/vnd.oci.image.manifest.v1+json" ] || die 3 "the index set is not an OCI image manifest"
+  [ "$(jget "$TMP/set.flat" artifactType)" = "application/vnd.aps.indexes.v1" ] || die 3 "$INDEXES_REPO:$INDEXES_SET is not an index set (artifactType)"
+  _nl="$(jcount layers/ "$TMP/set.flat")"; _i=0
+  [ "$_nl" -gt 0 ] || die 3 "the index set lists no files"
+  while [ "$_i" -lt "$_nl" ]; do
+    _ld="$(jget "$TMP/set.flat" "layers/$_i/digest")"; _title="$(jget "$TMP/set.flat" "layers/$_i/annotations/org.opencontainers.image.title")"
+    printf '%s' "$_title" | grep -Eq '^index-[0-9]{4}(-[0-9]{2})?\.fits$' || die 3 "index set file with an unusable name: '$_title'"
+    _i=$((_i + 1))
+    say "  [$_i/$_nl] $_title"
+    reg_fetch blobs "$_ld" "$_xd/blobs/sha256/${_ld#sha256:}"
+    ln -sf "../blobs/sha256/${_ld#sha256:}" "$_xd/files/$_title"
+  done
+  say "Index set $INDEXES_SET ready in $_xd (manifest $_md, $_nl files). Install offline with: install.sh --airgap $DL_DIR --indexes $INDEXES_SET"
+  REG_REPO=""
+}
+
+# ---------------------------------------------------------------- --airgap DIR: install from the offline bundle
+# DIR is the layout --download-bundle wrote (deploy/airgap/FORMAT.md). Nothing in it is trusted until verified: the root
+# (bundle-index.json) against the stamped digest, every blob against its file name. The image list and the files are then read
+# from the verified root and manifests, never from index.json or the files/ symlinks (which are conveniences, not evidence).
+AIRGAP=""; REG_HOST=""
+AG_IMAGES=""; AG_FILES=""
+ag_blob() { printf '%s/blobs/sha256/%s' "$AIRGAP" "${1#sha256:}"; }
+# ag_file TITLE: path of the verified blob holding the bundle file TITLE ("" when the bundle lacks it)
+ag_file() {
+  _agd="$(awk -F'\t' -v t="$1" '$1 == t { print $2; exit }' "$AG_FILES")"
+  [ -z "$_agd" ] || ag_blob "$_agd"
+}
+ag_need() { _agp="$(ag_file "$1")"; [ -n "$_agp" ] && [ -f "$_agp" ] || die 3 "the bundle has no $1 (an incomplete or foreign bundle; download it again with --download-bundle)"; printf '%s' "$_agp"; }
+
+airgap_verify() {
+  _d="$AIRGAP"
+  [ -f "$_d/oci-layout" ] && [ -f "$_d/bundle-index.json" ] && [ -d "$_d/blobs/sha256" ] \
+    || die 2 "$_d is not an offline bundle. On a connected machine run: install.sh --download-bundle $_d, then copy it here."
+  _want="${BUNDLE_DIGEST:-$BUNDLE_DIGEST_STAMPED}"
+  [ -n "$_want" ] || die 2 "this copy of install.sh has no stamped bundle digest (a development copy): pass --bundle-digest sha256:..."
+  valid_digest "$_want" || die 2 "--bundle-digest must look like sha256:<64 hex digits>, got: $_want"
+  blob_ok "$_d/bundle-index.json" "$_want" || die 3 "bundle-index.json does not match the bundle digest $_want: this is not the bundle this installer was published with"
+  say "Verifying the bundle in $_d (root $_want, then every blob)"
+  _n=0
+  for _f in "$_d"/blobs/sha256/*; do
+    [ -e "$_f" ] || continue
+    _b="${_f##*/}"
+    printf '%s' "$_b" | grep -Eq '^[0-9a-f]{64}$' || die 3 "unexpected file in the bundle (an unfinished download?): $_f"
+    [ "$(digest_of "$_f")" = "$_b" ] || die 3 "blob $_b is corrupt (its sha256 differs): download the bundle again"
+    _n=$((_n + 1))
+  done
+  [ "$_n" -gt 0 ] || die 3 "the bundle holds no blobs"
+  say "Bundle verified: $_n blobs"
+  BUNDLE_DIGEST="$_want"
+}
+
+# Reads the verified root: $TMP/ag-images lines "digest<TAB>ref", $TMP/ag-files lines "title<TAB>digest".
+airgap_load() {
+  mk_tmp
+  AG_IMAGES="$TMP/ag-images"; AG_FILES="$TMP/ag-files"; : > "$AG_IMAGES"; : > "$AG_FILES"
+  json_flat < "$AIRGAP/bundle-index.json" > "$TMP/ag-root.flat"
+  [ "$(jget "$TMP/ag-root.flat" mediaType)" = "application/vnd.oci.image.index.v1+json" ] || die 3 "the bundle root is not an OCI image index"
+  _n="$(jcount manifests/ "$TMP/ag-root.flat")"; _i=0
+  while [ "$_i" -lt "$_n" ]; do
+    _p="manifests/$_i"; _i=$((_i + 1)); _i0=$((_i - 1))
+    _dg="$(jget "$TMP/ag-root.flat" manifests/$_i0/digest)"; _ro="$(jget "$TMP/ag-root.flat" manifests/$_i0/annotations/io.aps.bundle.role)"
+    _rf="$(jget "$TMP/ag-root.flat" manifests/$_i0/annotations/org.opencontainers.image.ref.name)"
+    _os="$(jget "$TMP/ag-root.flat" manifests/$_i0/platform/os)"; _ar="$(jget "$TMP/ag-root.flat" manifests/$_i0/platform/architecture)"
+    if [ -n "$_os$_ar" ] && [ "$_os/$_ar" != "linux/$BUNDLE_ARCH" ]; then continue; fi
+    valid_digest "$_dg" || die 3 "bundle entry $_i0 has a malformed digest"
+    case "$_ro" in
+      image)
+        printf '%s' "$_rf" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:/@-]*$' || die 3 "bundle entry $_i0 has no usable image reference"
+        [ -f "$(ag_blob "$_dg")" ] || die 3 "the bundle lacks the manifest of $_rf"
+        printf '%s\t%s\n' "$_dg" "$_rf" >> "$AG_IMAGES" ;;
+      files)
+        [ -f "$(ag_blob "$_dg")" ] || die 3 "the bundle lacks its files manifest"
+        json_flat < "$(ag_blob "$_dg")" > "$TMP/ag-fm.flat"
+        _ln="$(jcount layers/ "$TMP/ag-fm.flat")"; _l=0
+        while [ "$_l" -lt "$_ln" ]; do
+          _t="$(jget "$TMP/ag-fm.flat" layers/$_l/annotations/org.opencontainers.image.title)"; _ld="$(jget "$TMP/ag-fm.flat" layers/$_l/digest)"
+          _l=$((_l + 1))
+          printf '%s' "$_t" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || die 3 "the bundle has a file with an unusable name"
+          valid_digest "$_ld" || die 3 "the bundle file $_t has a malformed digest"
+          printf '%s\t%s\n' "$_t" "$_ld" >> "$AG_FILES"
+        done ;;
+      *) die 3 "bundle entry $_i0 has an unknown role '$_ro'" ;;
+    esac
+  done
+  [ -s "$AG_IMAGES" ] || die 3 "the bundle lists no images"
+  [ -s "$AG_FILES" ] || die 3 "the bundle has no files entry"
+  ag_need aps-chart.tgz >/dev/null; ag_need helm >/dev/null
+}
+
+airgap_prepare() {
+  command -v sha256sum >/dev/null 2>&1 || die 2 "--airgap needs sha256sum on PATH"
+  [ -z "$NO_IDENTITY_VALUES" ] && [ -z "$URL_OVERRIDE" ] && [ -z "$(user_value routes host)" ] \
+    && die 2 "offline there is no sslip.io name for this node: pass --domain NAME (a name your browsers resolve to this host), --url URL, or --set routes.host=NAME"
+  [ -z "$REG_HOST" ] || [ -z "$BOOTSTRAP" ] || die 2 "--registry and --bootstrap cannot be combined: k3s imports the images itself"
+  airgap_verify
+  airgap_load
+  # no image is ever pulled: the images are already on the node (or in --registry), and an unset policy must not become Always
+  [ -n "$(set_value global.imagePullPolicy)" ] || { add_user "--set"; add_user "global.imagePullPolicy=IfNotPresent"; }
+  # the index preset is copied from the bundle; the fetcher only verifies it (chart: plateSolve.indexSource.mode=preSeeded)
+  [ -n "$(set_value plateSolve.indexSource.mode)" ] || { add_user "--set"; add_user "plateSolve.indexSource.mode=preSeeded"; }
+  if [ -z "$CHART" ]; then
+    CHART="$TMP/aps-chart.tgz"
+    cp "$(ag_need aps-chart.tgz)" "$CHART" || die 2 "cannot copy the bundled chart"
+  fi
+  airgap_index_profile
+}
+
+# --indexes SET with --airgap: the set must have been downloaded (DIR/indexes/SET) and the chart must provision exactly its files, so the
+# set's profile (the chart's profiles/index-*.yaml the publisher derived the file list from) is applied as a values file.
+airgap_index_profile() {
+  [ -n "$INDEXES_SET" ] || return 0
+  [ -f "$AIRGAP/indexes/$INDEXES_SET/manifest.json" ] || die 2 "the index set $INDEXES_SET is not in $AIRGAP: on a connected machine run install.sh --download-bundle $AIRGAP --indexes $INDEXES_SET"
+  _want="$(index_set_want)" || exit $?
+  blob_ok "$AIRGAP/indexes/$INDEXES_SET/manifest.json" "$_want" || die 3 "the index set manifest in $AIRGAP/indexes/$INDEXES_SET does not match the pinned digest $_want: not the set this installer was published with"
+  [ "$INDEXES_SET" != wide ] || return 0
+  _pf="$(index_profile "$INDEXES_SET")"
+  if [ -d "$CHART" ]; then cp "$CHART/profiles/$_pf" "$TMP/index-profile.yaml" 2>/dev/null
+  else
+    _pm="$(tar -tzf "$CHART" 2>/dev/null | grep "^[^/]*/profiles/$_pf\$" | head -n 1)"
+    [ -n "$_pm" ] && tar -xzOf "$CHART" "$_pm" > "$TMP/index-profile.yaml" 2>/dev/null
+  fi
+  [ -s "$TMP/index-profile.yaml" ] || die 2 "the chart has no profiles/$_pf (is it the chart of this release?)"
+  add_user "-f"; add_user "$TMP/index-profile.yaml"
+}
+
+airgap_helm() {
+  mkdir -p "$TMP/helm-bin" && cp "$(ag_need helm)" "$TMP/helm-bin/helm" && chmod 0755 "$TMP/helm-bin/helm" || die 2 "cannot unpack the bundled helm"
+  HELM="$TMP/helm-bin/helm"
+  helm_ok "$HELM" || die 3 "the bundled helm does not run on this machine (linux/amd64 only) or is older than 3.14"
+}
+
+# --bootstrap from the bundle: the pinned k3s binary, its airgap images and its install script, each checked against the
+# sha256 pinned in this script (the bundle's own digest already covers them, the pin ties them to this installer's k3s version).
+airgap_install_k3s() {
+  _v="${K3S_VERSION:-$PINNED_K3S_VERSION}"
+  [ "$_v" = "$PINNED_K3S_VERSION" ] || die 2 "the bundle carries k3s $PINNED_K3S_VERSION only, not $_v"
+  _kb="$(ag_need k3s)"; _ki="$(ag_need k3s-airgap-images-amd64.tar.zst)"; _ks="$(ag_need k3s-install.sh)"
+  [ "$(sha256_of "$_kb")" = "${APS_K3S_BINARY_SHA256:-$K3S_BINARY_SHA256_PINNED}" ] || die 2 "the bundled k3s binary does not match the pinned checksum; refusing to install it"
+  [ "$(sha256_of "$_ki")" = "${APS_K3S_AIRGAP_SHA256:-$K3S_AIRGAP_SHA256_PINNED}" ] || die 2 "the bundled k3s airgap images do not match the pinned checksum; refusing to use them"
+  [ "$(sha256_of "$_ks")" = "${APS_K3S_INSTALL_SHA256:-$K3S_INSTALL_SHA256_PINNED}" ] || die 2 "the bundled k3s installer does not match the pinned checksum; refusing to run it"
+  _bd="${APS_K3S_BIN_DIR:-/usr/local/bin}"; _id="${APS_K3S_IMAGES_DIR:-/var/lib/rancher/k3s/agent/images}"
+  say "Installing single-node k3s $_v from the bundle (no download)"
+  mkdir -p "$_bd" "$_id" || die 2 "cannot create $_bd or $_id"
+  cp "$_kb" "$_bd/k3s.aps-new" && chmod 0755 "$_bd/k3s.aps-new" && mv "$_bd/k3s.aps-new" "$_bd/k3s" || die 2 "cannot install the k3s binary into $_bd"
+  cp "$_ki" "$_id/k3s-airgap-images-amd64.tar.zst" || die 2 "cannot place the k3s airgap images in $_id"
+  INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_VERSION="$_v" INSTALL_K3S_BIN_DIR="$_bd" sh "$_ks" </dev/null \
+    || die 2 "the k3s installer failed (see its output above). Nothing else was installed; fix the cause and re-run, or remove a half-installed k3s with k3s-uninstall.sh"
+}
+
+# ag_canon_ref REF: the name a container runtime gives REF (Docker Hub default host and library/ namespace made explicit).
+ag_canon_ref() {
+  _r="$1"; _h="${_r%%/*}"
+  case "$_r" in
+    */*) case "$_h" in *.*|*:*|localhost) ;; *) _r="docker.io/$_r"; _h=docker.io ;; esac ;;
+    *) _r="docker.io/library/$_r"; _h=docker.io ;;
+  esac
+  case "$_h" in docker.io|registry-1.docker.io|index.docker.io)
+    _rest="${_r#*/}"; case "$_rest" in */*) ;; *) _rest="library/$_rest" ;; esac; _r="docker.io/$_rest" ;;
+  esac
+  printf '%s' "$_r"
+}
+
+# ag_collect DIGEST DIR: link the blob and everything it references (children, config, layers) that the bundle holds.
+ag_collect() {
+  _acb="$(ag_blob "$1")"; [ -f "$_acb" ] || return 0
+  [ -e "$2/blobs/sha256/${1#sha256:}" ] && return 0
+  ln -s "$_acb" "$2/blobs/sha256/${1#sha256:}"
+  [ "$(head -c 1 "$_acb")" = "{" ] || return 0
+  _ack="$(json_flat < "$_acb" | awk -F'\t' '$1 ~ /^(manifests|layers)\/[0-9]+\/digest$/ || $1 == "config/digest" { print $2 }')"
+  for _acd in $_ack; do valid_digest "$_acd" && ag_collect "$_acd" "$2"; done
+}
+
+# ag_stage DIGEST REF DIR: a one-image OCI layout (only that image's blobs, symlinked; index.json names it REF).
+ag_stage() {
+  rm -rf "$3"; mkdir -p "$3/blobs/sha256" || die 2 "cannot create a staging directory"
+  printf '%s\n' '{"imageLayoutVersion":"1.0.0"}' > "$3/oci-layout"
+  _mt="$(json_flat < "$(ag_blob "$1")" | awk -F'\t' '$1 == "mediaType" { print $2; exit }')"
+  [ -n "$_mt" ] || _mt="application/vnd.oci.image.manifest.v1+json"
+  ag_collect "$1" "$3"
+  printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"%s","digest":"%s","size":%s,"annotations":{"org.opencontainers.image.ref.name":"%s"}}]}\n' \
+    "$_mt" "$1" "$(wc -c < "$(ag_blob "$1")" | tr -d ' ')" "$(ag_canon_ref "$2")" > "$3/index.json"
+}
+
+# airgap_pin TOOL ctr REF: label an imported image so the kubelet's image GC never deletes it (offline it could not be pulled again).
+airgap_pin() {
+  "$1" ctr -n k8s.io images label "$3" io.cri-containerd.pinned=pinned >/dev/null </dev/null || die 2 "$1 could not pin $3 (the image is imported but may be garbage-collected)"
+}
+
+airgap_import_images() {
+  _how=""
+  if [ -n "$REG_HOST" ]; then
+    command -v skopeo >/dev/null 2>&1 || die 2 "--registry needs skopeo on PATH to push the images (not found). Install skopeo, or import into the node's containerd (k3s, microk8s) by leaving --registry out."
+    _how=push
+  elif command -v k3s >/dev/null 2>&1; then _how=k3s
+  elif command -v microk8s >/dev/null 2>&1; then _how=microk8s
+  else die 2 "no way to load the images: neither k3s nor microk8s is on this host. Pass --registry HOST (a registry the cluster pulls from; needs skopeo) or use --bootstrap."
+  fi
+  _total="$(grep -c . "$AG_IMAGES")"; _k=0
+  mk_tmp
+  while IFS="$(printf '\t')" read -r _dg _rf; do
+    _k=$((_k + 1))
+    ag_stage "$_dg" "$_rf" "$TMP/ag-stage"
+    _cr="$(ag_canon_ref "$_rf")"
+    case "$_how" in
+      k3s) say "[$_k/$_total] importing $_cr"
+        tar -chf - -C "$TMP/ag-stage" . | k3s ctr -n k8s.io images import - >/dev/null || die 2 "k3s could not import $_cr (run as root?)"
+        airgap_pin k3s ctr "$_cr" ;;
+      microk8s) say "[$_k/$_total] importing $_cr"
+        tar -chf - -C "$TMP/ag-stage" . | microk8s images import >/dev/null || die 2 "microk8s could not import $_cr"
+        airgap_pin microk8s ctr "$_cr" ;;
+      push) _dst="$REG_HOST/${_cr#*/}"; say "[$_k/$_total] pushing $_dst"
+        skopeo copy --override-os linux --override-arch amd64 ${PLAIN_HTTP:+--dest-tls-verify=false} "oci:$TMP/ag-stage" "docker://$_dst" >/dev/null </dev/null || die 2 "skopeo could not push $_dst" ;;
+    esac
+  done < "$AG_IMAGES"
+  rm -rf "$TMP/ag-stage"
+  if [ "$_how" = push ]; then
+    say "Images pushed to $REG_HOST under their original names (host dropped). The cluster's runtime must pull ghcr.io/..., docker.io/... etc. from there (a containerd registry mirror)."
+  elif [ "$(kc get nodes -o name 2>/dev/null | grep -c .)" -gt 1 ]; then
+    warn "this cluster has several nodes and the images were loaded on this node only: repeat on every node, or use --registry."
+  fi
+}
+
+# The wide index preset is copied into the fetcher's node directory; the fetcher (plateSolve.indexSource.mode=preSeeded) then
+# only checks the files exist, writes its own set marker and labels the node. Only THIS node is seeded.
+airgap_seed_indexes() {
+  [ "$(user_value plateSolve enabled)" != false ] || return 0
+  [ -z "$INDEXES_SET" ] || { airgap_seed_set; return 0; }
+  case "$(user_value plateSolve preset)" in ""|wide) ;;
+    *) warn "the bundle ships the wide index preset only: copy the index files for plateSolve.preset=$(user_value plateSolve preset) into the nodes' index directory yourself"; return 0 ;; esac
+  _m="$(ag_file index-wide.manifest)"
+  [ -n "$_m" ] || { warn "the bundle has no index files: plate solving needs them copied onto the nodes (docs/install.md, plateSolve.indexSource.mode=preSeeded)"; return 0; }
+  _dir="$(set_value plateSolve.indexes.hostPath)"; _dir="${_dir:-${APS_INDEX_DIR:-/var/lib/aps/astrometry-index}}"
+  mkdir -p "$_dir/.part" && chmod 0755 "$_dir" "$_dir/.part" 2>/dev/null || die 2 "cannot create the index directory $_dir (run as root, or pass --set plateSolve.indexes.hostPath=DIR)"
+  say "Seeding the astrometry indexes into $_dir"
+  while read -r _n _s _h || [ -n "$_n" ]; do
+    case "$_n" in ""|\#*) continue ;; esac   # blank lines and the manifest's comment header
+    printf '%s' "$_n" | grep -Eq '^index-[0-9A-Za-z._-]+$' || die 3 "bad index file name in the bundle: $_n"
+    _src="$(ag_need "$_n")"
+    [ "$(sha256_of "$_src")" = "$_h" ] || die 3 "index file $_n does not match its manifest checksum"
+    if [ -f "$_dir/$_n" ] && [ "$(wc -c < "$_dir/$_n" | tr -d ' ')" = "$_s" ]; then continue; fi
+    cp "$_src" "$_dir/.part/$_n" && chmod 0644 "$_dir/.part/$_n" && mv "$_dir/.part/$_n" "$_dir/$_n" || die 2 "cannot write $_dir/$_n"
+  done < "$_m"
+}
+
+# airgap_seed_set: --indexes SET: copy the downloaded set's files (DIR/indexes/SET, listed by its manifest) into the node directory, each
+# verified against the digest the manifest lists. Same destination and skip rule as the bundled wide preset.
+airgap_seed_set() {
+  _xd="$AIRGAP/indexes/$INDEXES_SET"
+  _dir="$(set_value plateSolve.indexes.hostPath)"; _dir="${_dir:-${APS_INDEX_DIR:-/var/lib/aps/astrometry-index}}"
+  mkdir -p "$_dir/.part" && chmod 0755 "$_dir" "$_dir/.part" 2>/dev/null || die 2 "cannot create the index directory $_dir (run as root, or pass --set plateSolve.indexes.hostPath=DIR)"
+  json_flat < "$_xd/manifest.json" > "$TMP/seed.flat"
+  _nl="$(jcount layers/ "$TMP/seed.flat")"; _i=0
+  [ "$_nl" -gt 0 ] || die 3 "the index set $INDEXES_SET lists no files"
+  say "Seeding the $INDEXES_SET astrometry index set ($_nl files) into $_dir"
+  while [ "$_i" -lt "$_nl" ]; do
+    _h="$(jget "$TMP/seed.flat" "layers/$_i/digest")"; _s="$(jget "$TMP/seed.flat" "layers/$_i/size")"
+    _n="$(jget "$TMP/seed.flat" "layers/$_i/annotations/org.opencontainers.image.title")"; _i=$((_i + 1))
+    printf '%s' "$_n" | grep -Eq '^index-[0-9]{4}(-[0-9]{2})?\.fits$' || die 3 "bad index file name in the set: $_n"
+    valid_digest "$_h" || die 3 "malformed digest for $_n in the set"
+    _src="$(ag_blobdir "$_xd")/${_h#sha256:}"
+    [ -f "$_src" ] || die 3 "the index set lacks $_n (download it again with --download-bundle $AIRGAP --indexes $INDEXES_SET)"
+    if [ -f "$_dir/$_n" ] && [ "$(wc -c < "$_dir/$_n" | tr -d ' ')" = "$_s" ]; then continue; fi
+    [ "$(sha256_of "$_src")" = "${_h#sha256:}" ] || die 3 "index file $_n does not match its digest in the set manifest"
+    say "  [$_i/$_nl] $_n"
+    cp "$_src" "$_dir/.part/$_n" && chmod 0644 "$_dir/.part/$_n" && mv "$_dir/.part/$_n" "$_dir/$_n" || die 2 "cannot write $_dir/$_n"
+  done
+}
+ag_blobdir() { printf '%s/blobs/sha256' "$1"; }
+
 main() {
   parse_args "$@"
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  [ -z "$INDEXES_SET" ] || [ -n "$DOWNLOAD_BUNDLE" ] || [ -n "$AIRGAP" ] || die 2 "--indexes goes with --download-bundle DIR (fetch the set) or --airgap DIR (seed it)"
+  [ -z "$DOWNLOAD_BUNDLE" ] || { download_bundle; exit 0; }
+  [ -z "$AIRGAP" ] || airgap_prepare
   [ -z "$BOOTSTRAP" ] || bootstrap
   preflight
   resolve_traefik
   security_values
   ensure_namespace
-  ensure_helm
+  if [ -n "$AIRGAP" ]; then airgap_helm; else ensure_helm; fi
   check_release_state
   resolve_identity
   identity_facts
   ensure_identity_entrypoint
+  if [ -n "$AIRGAP" ] && [ -z "$DRY_RUN" ]; then airgap_import_images; airgap_seed_indexes; fi
   fetch_chart
   run_helm
   [ -z "$DRY_RUN" ] || { say "dry run: nothing was installed"; exit 0; }

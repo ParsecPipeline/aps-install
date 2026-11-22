@@ -39,6 +39,8 @@ kubeconfig, writes only to a temporary directory it removes on exit, and runs `h
 | `--helm-version V` | pinned helm to download when none >= 3.14 is on `PATH` |
 | `--dry-run` | pass `--dry-run` to Helm: nothing is installed |
 | `--bootstrap`, `--k3s-version V` | install single-node k3s first on a bare host (next section) |
+| `--download-bundle DIR`, `--bundle-digest D`, `--indexes SET` | fetch a release's offline bundle (images, chart, helm, k3s, index files) into DIR as an OCI layout, with only curl and sha256sum; `--indexes wide|5200-lite|full` adds a larger astrometry index set (and, with `--airgap`, seeds it; its manifest digest must be pinned, `--indexes-digest D` for a set the script has no stamped digest for); the offline install itself is `--airgap`, see "Air-gapped and mirrored installs" |
+| `--airgap DIR`, `--registry HOST` | install from a downloaded bundle with no internet (see "Offline install from a bundle"); `--registry` pushes the images to your registry (needs skopeo) instead of importing them into k3s/microk8s |
 
 `uninstall.sh --help` lists `--release`, `--namespace`, `--context`, `--purge-data`, `--purge-crds`, `--purge-indexes`,
 `--index-image IMG` (the image of the purge pods when the release is already gone) and `--remove-k3s` (see Uninstalling).
@@ -519,3 +521,81 @@ pass it with `--chart` (local file) or host both files yourself and use `--chart
 required and verified). For the index files set `plateSolve.indexSource.baseURL=https://mirror.example.org` (an internal mirror with the
 same `4100/` layout), or `plateSolve.indexSource.mode=preSeeded` after copying the files onto the nodes yourself. An OCI registry without
 TLS needs `--plain-http`.
+
+### Offline install from a bundle
+
+On a connected machine: `sh install.sh --download-bundle ./aps-bundle` (curl and sha256sum only; format in `deploy/airgap/FORMAT.md`). Copy
+`./aps-bundle` and the same `install.sh` to the target host, then:
+
+```sh
+sudo sh install.sh --airgap ./aps-bundle --bootstrap --domain aps.example.org --yes    # bare host: k3s from the bundle
+sh install.sh --airgap ./aps-bundle --domain aps.example.org                           # existing k3s or microk8s on this host
+```
+
+The installer verifies the bundle (root digest stamped into this `install.sh`, then every blob; a corrupt or partial download is refused),
+loads every image into the node's containerd under its original name, uses the bundled Helm and chart, copies the `wide` astrometry index
+preset into the node's index directory (the index fetcher then only verifies; `plateSolve.indexSource.mode=preSeeded` is set for you) and
+pulls nothing (`global.imagePullPolicy=IfNotPresent`). `--bootstrap` installs the k3s version this installer pins from the bundled binary
+and image tarball, each checked against a checksum pinned in the script. There is no sslip.io name offline: give `--domain`, `--url` or
+`--set routes.host`. Images and indexes are loaded on the host that runs the installer only; on a multi-node cluster repeat it per node or
+use `--registry HOST` (skopeo pushes each image to `HOST/<repository>`, original registry host dropped; point the nodes' containerd
+registry mirrors at it).
+
+#### Larger index sets (`--indexes`)
+
+The bundle carries the `wide` preset only. The wider sets are separate artifacts (`<owner>/aps-indexes:wide|5200-lite|full`, ~4.6 GB and ~34 GB for the
+last two; format in `deploy/airgap/FORMAT.md`), fetched per file, digest-verified and resumable, into the same directory as the bundle:
+
+```sh
+sh install.sh --download-bundle ./aps-bundle --indexes 5200-lite        # connected machine; run it again to resume
+sudo sh install.sh --airgap ./aps-bundle --indexes 5200-lite --domain aps.example.org --yes
+```
+
+`--airgap ... --indexes SET` copies that set (not the bundled wide files) into the node's index directory and applies the chart's profile for it
+(`profiles/index-5200lite.yaml`, `profiles/index-full.yaml`), so the chart provisions exactly the files that were seeded. Other selections
+(`plateSolve.preset=telescope`, a custom list) must still be copied onto the nodes by hand.
+
+A set's manifest is never trusted by its tag. Each release's `install.sh` carries the manifest digests of the sets published with it
+(`# @index-set-digests`), the manifest is fetched by that digest and refused unless its bytes hash to it, every file is then checked against the
+digest the manifest lists, and `--airgap` checks the carried manifest against the same digest again before it seeds anything. A set the script has
+no digest for (a development copy, a set published after the release) is refused unless you pin it yourself with `--indexes-digest sha256:...`
+(the digest `deploy/airgap/publish-indexes.sh` printed). There is no flag or environment variable that skips a verification.
+
+#### What is verified, and what is not
+
+- The bundle: its root digest is stamped into the release's `install.sh`; every blob must hash to its name. Download and install both check it.
+- The index sets: as above, through the stamped (or given) manifest digest.
+- k3s: the binary and image tarball against the checksums pinned in the script.
+- Not verified: the `install.sh` you start with (fetch it over TLS from the release you trust, or check its published checksum), and the host's own
+  OS. The downloader speaks TLS to the registry with certificate verification always on; nothing is stored in `~/.docker` or any credential file.
+
+#### Hosts reached by IP address
+
+With `--url http://<ip>` there is no host name for the identity provider or Argo. On such a host the Argo UI (which needs its own name for
+single sign-on) is switched off and the installer says why; use `--domain` (with your own DNS or `/etc/hosts` entries) to have it. Nothing offline is
+rewritten to an sslip.io name.
+
+#### Time and addresses
+
+An air-gapped host still needs a correct clock and an address. The offline smoke's egress block lets the host's own DHCP (udp 67) and NTP
+(udp 123, NTS key exchange tcp 4460) traffic through, because a site runs its own servers for those; pods cannot use that exemption. Point
+the host at your site's DHCP and NTP servers (or set a static address and run chrony against a local source); a clock that drifts breaks TLS
+and token expiry inside the cluster.
+
+The first step is the only one that needs a network. A typical end-to-end run, and what you can check afterwards:
+
+```sh
+# 1. connected machine: download (the digest is stamped into the release's install.sh; --bundle-digest overrides it)
+sh install.sh --download-bundle ./aps-bundle
+tar cf aps-offline.tar aps-bundle install.sh                    # 2. carry it (disk, transfer appliance) to the target
+tar xf aps-offline.tar && sudo sh install.sh --airgap ./aps-bundle --bootstrap --url http://<node-ip> --domain-mode single-host --yes   # 3.
+```
+
+What is verified: every release CI run installs this way on a disposable VM with all outbound traffic blocked (`offline-smoke`:
+`deploy/smoke/vm/offline-smoke.sh`). The VM keeps only loopback, the cluster's own pod and service ranges, its management interface and the CI
+server. The bundle is built from that commit's images in a throwaway local registry, downloaded while the network is still up, then the network is
+cut, the host is reset to bare, `install.sh --airgap --bootstrap` installs k3s and the platform, and the whole acceptance smoke runs (register, upload,
+plate solve against the bundled `wide` index preset, metadata, search, stack, calibrate, render, re-run, uninstall and reinstall, purge). The job fails
+when the kernel firewall counted even one dropped packet, and prints the destinations it logged. To check your own host the same way, block
+egress, install, and read the firewall counter: `deploy/smoke/vm/egress-block.sh on --allow-if <your-management-interface>` ... `report` ... `off`
+(it removes itself after a timeout, 120 minutes by default).
