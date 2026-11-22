@@ -18,7 +18,7 @@
 # Defaults rewritten at publish time by deploy/ci/package-chart.sh (aps_stamp_defaults); the committed values are the
 # "latest published chart" defaults.
 DEFAULT_CHART_URL="oci://ghcr.io/parsecpipeline/charts/aps" # @chart-url
-DEFAULT_VERSION="0.7.0" # @version
+DEFAULT_VERSION="0.7.1" # @version
 BRAND_NAME="Astro Pixel Platform" # @brand-name (generated from brand.yaml by deploy/helm/sync-brand.sh; this script is published alone)
 
 # --bootstrap (opt-in): single-node k3s. The pinned version, and the sha256 of the official installer script AT THAT
@@ -1473,7 +1473,7 @@ jget() { awk -F'\t' -v p="$2" '$1 == p { print $2; exit }' "$1"; }
 jcount() { awk -F'\t' -v p="$1" 'BEGIN { m = -1 } index($1, p) == 1 { split(substr($1, length(p) + 1), a, "/"); if (a[1] + 0 > m) m = a[1] + 0 } END { print m + 1 }' "$2"; }
 
 # The root digest of this release's offline bundle, stamped at publish time (deploy/airgap/publish-bundle.sh).
-BUNDLE_DIGEST_STAMPED="sha256:f0614afb163a3868e0dad06beefa189b80ff7ffb0aeb0b86ef953667afd794f7" # @bundle-digest
+BUNDLE_DIGEST_STAMPED="sha256:705eea540ea0e69255b22e4ca2c67da867ca92688d78c8fe6aa9428f9fb35b54" # @bundle-digest
 # The manifest digests of the published astrometry index sets ("SET=sha256:... SET=sha256:..."), stamped at release time from
 # deploy/airgap/index-sets.lock. A set is never read by tag alone: its manifest must match this list or --indexes-digest.
 INDEX_SET_DIGESTS_STAMPED="wide=sha256:f2567eedf4b6d4d1ce614a091cbcec98b0a999cd2b1bd5445de5a4dcdd8d267e" # @index-set-digests
