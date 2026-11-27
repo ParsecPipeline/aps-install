@@ -319,7 +319,7 @@ Pass overrides with `--set key=value` and/or `--values file.yaml` (repeatable; t
 | `global.storageClass` | cluster default | StorageClass of the Postgres and object-store PVCs |
 | `traefik.install` | unset (auto) | `true` installs Traefik with the release, `false` reuses the cluster's; `install.sh` decides when unset |
 | `routes.enabled`, `routes.host`, `routes.port` | on, `aps.localtest.me` | the IngressRoutes; `routes.host` is required (see Names), `routes.port` when the public port is not 80/443 |
-| `uploads.*`, `reads.*` | 64g per file, 16Mi parts | the direct-to-store upload limit model and presigned read URLs: [docs/scale.md](scale.md) |
+| `uploads.*`, `reads.*` | 64g per file, 8Mi parts | the direct-to-store upload limit model and presigned read URLs: [docs/scale.md](scale.md) |
 | `routes.api/auth/web/identity.middlewares` | none | extra Traefik Middleware references per route (rate limits for `/auth` and the login, forward-auth) |
 | `tls.mode` | `none` | `none`, `certManager` (needs `routes.host`, `tls.certManager.issuerRef.name`), `secret` (`tls.secretName`) or `upstream` (TLS ends in front of Traefik; needs `routes.host`) |
 | `plateSolve.enabled` | `true` | per-node indexes + solving; `false` = no DaemonSet, no solve |
